@@ -25,6 +25,7 @@ from rasterio.features import rasterize
 from config import (
     SLOPE_OPTIMAL_PCT, SLOPE_MODERATE_PCT, SLOPE_MAX_PCT, SLOPE_CLIFF_PCT,
     IMPASSABLE, WATER_PENALTY_TIERS, BORDER_CELLS, DEM_NODATA_SENTINEL,
+    BUILDING_PENALTY
 )
 
 log = logging.getLogger("highway_alignment")
@@ -391,7 +392,9 @@ def build_cost_surface(slope_pct, building_mask, water_mask, nodata_mask=None,
         cost = np.where(floodplain & (cost < IMPASSABLE), cost * 3.0, cost)
 
     # ── 6. Building exclusion ─────────────────────────────────────────────
-    cost = np.where(building_mask > 0, IMPASSABLE, cost)
+    # Buildings are now an expensive soft constraint (expropriation penalty)
+    # rather than impassable terrain.
+    cost = np.where(building_mask > 0, cost + BUILDING_PENALTY, cost)
 
     # ── 7. NoData exclusion ───────────────────────────────────────────────
     if nodata_mask is not None:

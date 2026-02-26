@@ -80,7 +80,8 @@ RUBBER_BAND_MACRO_W    = _p["rubber_band_macro_weight"]
 RUBBER_BAND_MICRO_W    = _p["rubber_band_micro_weight"]
 
 # ── Right-of-Way ───────────────────────────────────────────────────────────────
-ROW_BUFFER_M = 61          # Setback from centreline to structures (200 ft standard)
+ROW_BUFFER_M = 30          # Setback from centreline to structures (reduced for soft constraint)
+BUILDING_PENALTY = 5000    # Added cost for routing through a building buffer (triggers resettlement)
 
 # ── Water Crossing Penalties (per river tier) ──────────────────────────────────
 # Tier 0: micro-stream < 10 m  → culvert / ford
