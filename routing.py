@@ -305,13 +305,13 @@ def _bank_stability_score(water_mask, r, c, dem, resolution_m, band_px=5):
     return 1.0 + (np.mean(slopes) / 100.0) + (np.std(slopes) / 50.0)
 
 
-def find_optimal_crossing(water_mask, macro_path, transform, resolution_m,
-                           dem=None, search_window_px=200):
+def find_optimal_crossings(water_mask, macro_path, transform, resolution_m,
+                             dem=None, search_window_px=200):
     rows, cols = water_mask.shape
     water_hits = [(i, r, c) for i, (r, c) in enumerate(macro_path) if water_mask[r, c] > 0]
     if not water_hits:
         log.info("Macro path did not cross water — no bridge needed.")
-        return None
+        return []
 
     segments, seg = [], [water_hits[0]]
     for prev, curr in zip(water_hits, water_hits[1:]):
@@ -323,7 +323,7 @@ def find_optimal_crossing(water_mask, macro_path, transform, resolution_m,
     segments.append(seg)
     log.info(f"Water-body segments intersected: {len(segments)}")
 
-    best_rc, best_score = None, float("inf")
+    bridges_rc = []
     for seg in segments:
         seg_centre_idx = seg[len(seg) // 2][0]
         lo = max(0, seg_centre_idx - search_window_px)
@@ -334,6 +334,7 @@ def find_optimal_crossing(water_mask, macro_path, transform, resolution_m,
         if not candidates:
             candidates = [(seg[len(seg)//2][1], seg[len(seg)//2][2])]
 
+        best_rc_for_seg, best_score_for_seg = None, float("inf")
         for r, c in candidates:
             path_idx = next((i for i, (pr,pc) in enumerate(macro_path) if pr==r and pc==c), None)
             if path_idx is None or path_idx == 0 or path_idx >= len(macro_path)-1:
@@ -358,25 +359,25 @@ def find_optimal_crossing(water_mask, macro_path, transform, resolution_m,
                     braiding = 3.0
 
             score = width_m * _bank_stability_score(water_mask, r, c, dem, resolution_m) * braiding
-            if score < best_score:
-                best_score, best_rc = score, (r, c)
+            if score < best_score_for_seg:
+                best_score_for_seg, best_rc_for_seg = score, (r, c)
 
-    if best_rc:
-        r, c = best_rc
-        x = transform.c + (c+0.5) * transform.a
-        y = transform.f + (r+0.5) * transform.e
-        log.info(f"Bridge siting: grid={best_rc}, UTM=({x:.0f},{y:.0f}), score={best_score:.1f}")
-    return best_rc
+        if best_rc_for_seg:
+            bridges_rc.append(best_rc_for_seg)
+            bx, by = transform.c + (best_rc_for_seg[1]+0.5) * transform.a, transform.f + (best_rc_for_seg[0]+0.5) * transform.e
+            log.info(f"Bridge sited at grid={best_rc_for_seg}, UTM=({bx:.0f},{by:.0f}) score={best_score_for_seg:.1f}")
+
+    return bridges_rc
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Two-pass rubber-band micro-alignment (within a corridor)
+# Multi-pass rubber-band micro-alignment (within a corridor)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def two_pass_routing(cost, start_rc, end_rc, water_mask, transform,
-                      resolution_m=30, dem=None, reference_mask=None):
+def multi_pass_routing(cost, start_rc, end_rc, water_mask, transform,
+                       resolution_m=30, dem=None, reference_mask=None):
     """
-    Macro rubber-band → bridge siting → two micro-alignment passes.
+    Macro rubber-band → bridge siting → N micro-alignment passes.
     Called by coarse_to_fine_routing on the band-masked fine cost grid.
     If reference_mask is provided, rubber-banding pulls toward that mask
     (e.g. the coarse centerline) instead of the global straight line.
@@ -387,167 +388,241 @@ def two_pass_routing(cost, start_rc, end_rc, water_mask, transform,
     )
     macro_path = find_path(macro_cost, start_rc, end_rc)
 
-    bridge_rc = find_optimal_crossing(water_mask, macro_path, transform, resolution_m, dem=dem)
+    bridges_rc = find_optimal_crossings(water_mask, macro_path, transform, resolution_m, dem=dem)
 
-    if bridge_rc is None:
+    if not bridges_rc:
         log.info("No water crossing — single micro-alignment pass.")
         micro_cost = apply_rubber_band_penalty(
             cost, start_rc, end_rc, weight=RUBBER_BAND_MICRO_W, reference_mask=reference_mask
         )
         return find_path(micro_cost, start_rc, end_rc)
 
-    log.info("Micro alignment 2a: Origin → Bridge …")
-    mc1 = apply_rubber_band_penalty(
-        cost, start_rc, bridge_rc, weight=RUBBER_BAND_MICRO_W, reference_mask=reference_mask
-    )
-    path1 = find_path(mc1, start_rc, bridge_rc)
+    # Dedup sequential identical bridges just in case
+    clean_bridges = []
+    for br in bridges_rc:
+        if not clean_bridges or br != clean_bridges[-1]:
+            clean_bridges.append(br)
 
-    log.info("Micro alignment 2b: Bridge → Destination …")
-    mc2 = apply_rubber_band_penalty(
-        cost, bridge_rc, end_rc, weight=RUBBER_BAND_MICRO_W, reference_mask=reference_mask
-    )
-    path2 = find_path(mc2, bridge_rc, end_rc)
+    # Build sequence of waypoints: Start -> Bridge 1 -> Bridge 2 -> ... -> End
+    waypoints = [start_rc] + clean_bridges + [end_rc]
+    full_path = []
 
-    full_path = path1 + path2[1:]
+    for i in range(len(waypoints) - 1):
+        wp_from = waypoints[i]
+        wp_to = waypoints[i + 1]
+        log.info(f"Micro alignment {i + 1}/{len(waypoints) - 1}: {wp_from} → {wp_to} …")
+        mc_seg = apply_rubber_band_penalty(
+            cost, wp_from, wp_to, weight=RUBBER_BAND_MICRO_W, reference_mask=reference_mask
+        )
+        seg_path = find_path(mc_seg, wp_from, wp_to)
+        if i > 0:
+            full_path += seg_path[1:]
+        else:
+            full_path += seg_path
+
     log.info(f"Combined path: {len(full_path)} waypoints")
     return full_path
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Phase 4: Two-resolution routing  (coarse corridor → fine band)
+# Phase 4: Multi-Scale Segmented LCP (Tang & Dou 2023)
 # ═══════════════════════════════════════════════════════════════════════════════
-
-def _downsample_cost(cost, factor):
-    """
-    Block-reduce cost grid by `factor` using np.max (conservative: worst cell wins).
-    Ensures impassable features are preserved on the coarse grid.
-    Trims to a multiple of `factor` before reshaping.
-    """
-    rows, cols = cost.shape
-    rows_t = (rows // factor) * factor
-    cols_t = (cols // factor) * factor
-    trimmed = cost[:rows_t, :cols_t]
-    # Reshape to (coarse_rows, factor, coarse_cols, factor) then max over blocks
-    coarse = trimmed.reshape(rows_t // factor, factor, cols_t // factor, factor)
-    return coarse.max(axis=(1, 3))
-
-
-def _build_fine_band_mask(coarse_path, coarse_shape, fine_shape, factor, band_km, resolution_m):
-    """
-    1. Mark coarse path cells on a coarse boolean grid.
-    2. Dilate by band_cells_coarse (= band_km * 1000 / coarse_resolution_m).
-    3. Upsample to fine resolution by repeating each cell `factor` times.
-    4. Clip/pad to match fine_shape exactly.
-    Returns a boolean mask: True = inside corridor band.
-    """
-    coarse_resolution_m = factor * resolution_m
-    band_cells_coarse = max(1, int(band_km * 1000.0 / coarse_resolution_m))
-
-    coarse_mask = np.zeros(coarse_shape, dtype=bool)
-    cr, cc = coarse_shape
-    for r, c in coarse_path:
-        if 0 <= r < cr and 0 <= c < cc:
-            coarse_mask[r, c] = True
-
-    struct = np.ones((2 * band_cells_coarse + 1, 2 * band_cells_coarse + 1), dtype=bool)
-    coarse_band = binary_dilation(coarse_mask, structure=struct)
-
-    # Upsample: each coarse cell → factor × factor fine cells
-    fine_band = np.repeat(np.repeat(coarse_band, factor, axis=0), factor, axis=1)
-    
-    # Also create a mask for JUST the upsampled central path (for rubber-banding)
-    fine_centerline = np.repeat(np.repeat(coarse_mask, factor, axis=0), factor, axis=1)
-
-    # Crop or pad to exactly match fine_shape
-    fr, fc = fine_shape
-    if fine_band.shape[0] >= fr and fine_band.shape[1] >= fc:
-        fine_band = fine_band[:fr, :fc]
-        fine_centerline = fine_centerline[:fr, :fc]
-    else:
-        padded = np.zeros(fine_shape, dtype=bool)
-        padded_center = np.zeros(fine_shape, dtype=bool)
-        h = min(fine_band.shape[0], fr)
-        w = min(fine_band.shape[1], fc)
-        padded[:h, :w] = fine_band[:h, :w]
-        padded_center[:h, :w] = fine_centerline[:h, :w]
-        fine_band = padded
-        fine_centerline = padded_center
-
-    # Guarantee endpoints are always inside the band (safety margin)
-    return fine_band, fine_centerline
-
+import concurrent.futures
 
 def _clamp_rc(rc, shape):
-    return (max(0, min(shape[0]-1, rc[0])), max(0, min(shape[1]-1, rc[1])))
+    return (max(0, min(shape[0]-1, int(rc[0]))), max(0, min(shape[1]-1, int(rc[1]))))
 
 
-def coarse_to_fine_routing(cost, start_rc, end_rc, water_mask, transform,
-                            resolution_m=30, dem=None,
-                            factor=COARSE_FACTOR, band_km=CORRIDOR_BAND_KM):
+def _extract_directional_waypoints(path, angle_thresh_deg, max_dist_px=200):
     """
-    Two-resolution routing strategy:
-
-    ┌─────────────────────────────────────────────────────────────────┐
-    │ Pass 0 (Coarse, ~300 m): Dijkstra on 10× downsampled grid      │
-    │   → identifies the macro corridor in seconds                    │
-    │   → memory: ~1/100 of full fine grid                           │
-    │                                                                 │
-    │ Band masking: 8 km corridor carved around coarse path           │
-    │   → reduces active fine-routing area to ~10–20% of total grid  │
-    │                                                                 │
-    │ Pass 1+2 (Fine, 30 m): Full two-pass rubber-band routing        │
-    │   within the band-masked cost grid                              │
-    └─────────────────────────────────────────────────────────────────┘
-
-    FAST_MODE (config): skips the fine pass entirely — coarse path only.
-    Useful for rapid scenario screening before committing to a full run.
+    Extract key directional points from a path (Tang & Dou 2023).
+    A point P[i] is a directional point if the angle between vector(P[i-1], P[i]) 
+    and vector(P[i], P[i+1]) is <= angle_thresh_deg.
+    Additionally retains points if distance from last waypoint exceeds max_dist_px.
     """
-    rows, cols = cost.shape
+    if len(path) < 3:
+        return path
 
-    # ── Coarse pass ────────────────────────────────────────────────────────
-    log.info(f"Coarse routing: downsampling {factor}× ({rows}×{cols} → "
-             f"{rows//factor}×{cols//factor}) …")
-    coarse_cost = _downsample_cost(cost, factor)
-    coarse_shape = coarse_cost.shape
+    cos_threshold = math.cos(math.radians(angle_thresh_deg))
+    waypoints = [path[0]]
+    last_wp_idx = 0
 
-    start_coarse = _clamp_rc((start_rc[0]//factor, start_rc[1]//factor), coarse_shape)
-    end_coarse   = _clamp_rc((end_rc[0]//factor,   end_rc[1]//factor),   coarse_shape)
+    for i in range(1, len(path) - 1):
+        r0, c0 = path[i - 1]
+        r1, c1 = path[i]
+        r2, c2 = path[i + 1]
+        
+        v1r, v1c = r1 - r0, c1 - c0
+        v2r, v2c = r2 - r1, c2 - c1
+        
+        mag1 = math.sqrt(v1r * v1r + v1c * v1c)
+        mag2 = math.sqrt(v2r * v2r + v2c * v2c)
+        
+        dist_from_last = math.sqrt((r1 - path[last_wp_idx][0])**2 + (c1 - path[last_wp_idx][1])**2)
+        
+        if mag1 < 1e-9 or mag2 < 1e-9:
+            continue
+            
+        cos_angle = (v1r * v2r + v1c * v2c) / (mag1 * mag2)
+        
+        # cos_angle <= cos_threshold means the turn is sharper than the threshold angle
+        if cos_angle <= cos_threshold or dist_from_last >= max_dist_px:
+            waypoints.append(path[i])
+            last_wp_idx = i
+            
+    waypoints.append(path[-1])
+    return waypoints
 
-    coarse_path = find_path(coarse_cost, start_coarse, end_coarse)
-    log.info(f"Coarse path: {len(coarse_path)} waypoints "
-             f"(~{len(coarse_path)*factor*resolution_m/1000:.1f} km equivalent)")
 
-    # ── FAST_MODE early exit ────────────────────────────────────────────────
-    if FAST_MODE:
-        log.info("FAST_MODE active — returning coarse path (upsampled to fine grid).")
-        # Map coarse coordinates back to fine grid centre points
-        fine_path = [(r*factor + factor//2, c*factor + factor//2)
-                     for r, c in coarse_path]
-        # Clamp to fine grid bounds
-        fine_path = [_clamp_rc(rc, (rows, cols)) for rc in fine_path]
+def _map_waypoints_to_high_res(waypoints_low, high_cost, ratio):
+    """
+    Project low-resolution waypoints to high-resolution grid.
+    Searches the corresponding ratio x ratio block and selects the cell with minimum cost.
+    """
+    mapped = []
+    rows, cols = high_cost.shape
+    for (r, c) in waypoints_low:
+        r_hi = r * ratio
+        c_hi = c * ratio
+        
+        # Search block
+        r_end = min(r_hi + ratio, rows)
+        c_end = min(c_hi + ratio, cols)
+        
+        block = high_cost[r_hi:r_end, c_hi:c_end]
+        if block.size == 0:
+            mapped.append((r_hi, c_hi))
+            continue
+            
+        # Find min cost in block
+        min_idx = np.unravel_index(np.argmin(block, axis=None), block.shape)
+        mapped.append((r_hi + min_idx[0], c_hi + min_idx[1]))
+        
+    return mapped
+
+
+def _route_segment_worker(args):
+    """
+    Worker for parallel routing between two waypoints.
+    args: (cost_grid, wp_from, wp_to)
+    Note: passes a cropped view of cost_grid to save memory/compute.
+    """
+    cost_grid, wp_from, wp_to = args
+    r0, c0 = wp_from
+    r1, c1 = wp_to
+    
+    # Margin for local bounding box (dynamic based on distance, min 50px)
+    dist = math.sqrt((r1 - r0)**2 + (c1 - c0)**2)
+    margin = max(50, int(dist * 0.3))
+    
+    rmin = max(0, min(r0, r1) - margin)
+    rmax = min(cost_grid.shape[0], max(r0, r1) + margin + 1)
+    cmin = max(0, min(c0, c1) - margin)
+    cmax = min(cost_grid.shape[1], max(c0, c1) + margin + 1)
+    
+    local_cost = cost_grid[rmin:rmax, cmin:cmax]
+    
+    local_start = _clamp_rc((r0 - rmin, c0 - cmin), local_cost.shape)
+    local_end = _clamp_rc((r1 - rmin, c1 - cmin), local_cost.shape)
+    
+    local_path = find_path(local_cost, local_start, local_end)
+    
+    # Re-translate to global coordinates
+    global_path = [(r + rmin, c + cmin) for r, c in local_path]
+    return global_path
+
+
+def multi_scale_lcp(cost_pyramid, start_rc, end_rc, water_mask, transform, resolution_m=30, dem=None):
+    """
+    Progressive MS-LCP strategy (Tang & Dou 2023):
+    1. Route on coarsest level.
+    2. Extract waypoints, project to N-1, route between waypoints in parallel.
+    3. Repeat until Level 0.
+    4. Execute final micro-alignment pass with highway constraints.
+    """
+    from config import DOWNSAMPLE_RATIO, WAYPOINT_ANGLE_THRESH_DEG, PARALLEL_WAYPOINT_THRESH, FAST_MODE
+
+    levels = len(cost_pyramid) - 1
+    log.info(f"MS-LCP: Starting multi-scale routing over {levels} downsampled levels.")
+    
+    # 1. Base route on the coarsest level
+    coarsest_ratio = DOWNSAMPLE_RATIO ** levels
+    curr_start = _clamp_rc((start_rc[0] // coarsest_ratio, start_rc[1] // coarsest_ratio), cost_pyramid[-1].shape)
+    curr_end = _clamp_rc((end_rc[0] // coarsest_ratio, end_rc[1] // coarsest_ratio), cost_pyramid[-1].shape)
+    
+    log.info(f"MS-LCP: Pass 0 (Level {levels}) - Routing on {cost_pyramid[-1].shape} grid.")
+    curr_path = find_path(cost_pyramid[-1], curr_start, curr_end)
+    
+    if FAST_MODE and levels > 0:
+        log.info("FAST_MODE active — returning upsampled coarse path.")
+        fine_path = [
+            _clamp_rc((r * coarsest_ratio + coarsest_ratio // 2, c * coarsest_ratio + coarsest_ratio // 2), cost_pyramid[0].shape)
+            for r, c in curr_path
+        ]
         return fine_path
 
-    # ── Build band mask & centerline mask ─────────────────────────────────
-    fine_band, fine_centerline = _build_fine_band_mask(
-        coarse_path, coarse_shape, (rows, cols), factor, band_km, resolution_m
-    )
-    # Always include the exact endpoint cells
-    fine_band[start_rc[0], start_rc[1]] = True
-    fine_band[end_rc[0],   end_rc[1]]   = True
-    fine_centerline[start_rc[0], start_rc[1]] = True
-    fine_centerline[end_rc[0],   end_rc[1]]   = True
-
-    coverage_pct = fine_band.sum() / fine_band.size * 100
-    log.info(f"Corridor band: {fine_band.sum():,} cells ({coverage_pct:.1f}% of fine grid), "
-             f"band_km={band_km} km each side")
-
-    # ── Apply band to fine cost ────────────────────────────────────────────
-    banded_cost = np.where(fine_band, cost, IMPASSABLE)
-    banded_water = np.where(fine_band, water_mask, 0).astype(water_mask.dtype)
-
-    # ── Fine two-pass routing within band ─────────────────────────────────
-    log.info("Fine routing within corridor band (with centerline rubber-banding) …")
-    return two_pass_routing(
-        banded_cost, start_rc, end_rc, banded_water, transform,
+    # 2. Iterate up the pyramid
+    for lvl in range(levels - 1, -1, -1):
+        high_res_cost = cost_pyramid[lvl]
+        log.info(f"MS-LCP: Pass {levels - lvl} (Level {lvl}) - Projecting to {high_res_cost.shape} grid.")
+        
+        # Extract waypoints
+        waypoints_low = _extract_directional_waypoints(curr_path, WAYPOINT_ANGLE_THRESH_DEG)
+        log.info(f"MS-LCP: Extracted {len(waypoints_low)} waypoints from coarse path.")
+        
+        # Map to high res
+        waypoints_hi = _map_waypoints_to_high_res(waypoints_low, high_res_cost, DOWNSAMPLE_RATIO)
+        
+        # Ensure exact start/end at Level 0
+        if lvl == 0:
+            waypoints_hi[0] = start_rc
+            waypoints_hi[-1] = end_rc
+            
+        # Segmented routing
+        segments = []
+        tasks = []
+        
+        # Prepare tasks
+        for i in range(len(waypoints_hi) - 1):
+            tasks.append((high_res_cost, waypoints_hi[i], waypoints_hi[i+1]))
+            
+        use_parallel = len(tasks) >= PARALLEL_WAYPOINT_THRESH
+        
+        if use_parallel:
+            # Note: ThreadPoolExecutor is used because `find_path` underlying C-extensions (scikit-image/skfmm) release the GIL.
+            # This avoids heavy IPC memory serialization of the large cost_grid that ProcessPoolExecutor would incur.
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                results = list(executor.map(_route_segment_worker, tasks))
+                for i, res in enumerate(results):
+                    if i > 0 and len(res) > 0:
+                        segments.append(res[1:])
+                    else:
+                        segments.append(res)
+        else:
+            for task in tasks:
+                res = _route_segment_worker(task)
+                if len(segments) > 0 and len(res) > 0:
+                    segments.append(res[1:])
+                else:
+                    segments.append(res)
+                    
+        curr_path = [pt for seg in segments for pt in seg]
+        log.info(f"MS-LCP: Level {lvl} path stitched, total waypoints={len(curr_path)}")
+        
+    # 3. Final Highway Engineering Pass (Level 0)
+    log.info("MS-LCP: Executing final micro-alignment (highway constraints) on Level 0.")
+    
+    # Build a mask of the stitched line for the final rubber-band pull
+    fine_centerline = np.zeros(cost_pyramid[0].shape, dtype=bool)
+    for r, c in curr_path:
+        fine_centerline[_clamp_rc((r, c), fine_centerline.shape)] = True
+        
+    struct = np.ones((5, 5), dtype=bool)
+    fine_centerline = binary_dilation(fine_centerline, structure=struct)
+    
+    final_path = multi_pass_routing(
+        cost_pyramid[0], start_rc, end_rc, water_mask, transform,
         resolution_m=resolution_m, dem=dem, reference_mask=fine_centerline
     )
+    
+    return final_path

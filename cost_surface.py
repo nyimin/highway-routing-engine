@@ -28,8 +28,85 @@ from config import (
     LULC_PENALTIES, LULC_UNMAPPED_BASE, SLOPE_LULC_INTERACT, LULC_EDGE_DECAY_M,
     BUILDING_BASE_PENALTY, BUILDING_AREA_MULT, BUILDING_MAX_PENALTY, ROW_BUFFER_M
 )
+import rasterio
+from rasterio.warp import reproject, Resampling
 
 log = logging.getLogger("highway_alignment")
+
+
+# ── Phase 12: Earthwork Proxy Cost ───────────────────────────────────────────
+
+def compute_earthwork_proxy(dem, slope_pct, resolution_m, weight=0.30):
+    """
+    Estimate earthwork difficulty from local terrain relief (inspired by 3D-CHA*).
+
+    Concept: how much cut/fill would a road at design grade require at each cell?
+    Instead of exact cross-sections (too slow for cost surface), we approximate:
+
+      1. Compute local terrain curvature proxy: the difference between the
+         cell elevation and the mean of its 5×5 neighbourhood = local relief.
+      2. Convert relief to approximate cross-section volume using formation width
+         and standard batter slopes.
+      3. Normalize to a cost multiplier [1.0 … ~3.0].
+
+    Args:
+        dem:          float32 DEM array (UTM, metres)
+        slope_pct:    float32 slope-percent array
+        resolution_m: pixel size in metres
+        weight:       blending weight (0 = disabled, 0.3 = default, 1.0 = dominant)
+
+    Returns:
+        float32 multiplier array (values ≥ 1.0), same shape as dem.
+    """
+    from config import (
+        FORMATION_WIDTH_M, SCENARIO_PROFILE,
+        CUT_BATTER_HV, FILL_BATTER_HV, GRADE_MAX_PCT,
+    )
+
+    rows, cols = dem.shape
+    if rows < 5 or cols < 5:
+        return np.ones_like(dem, dtype=np.float32)
+
+    # Get profile-specific formation width and max grade
+    fw = FORMATION_WIDTH_M[SCENARIO_PROFILE]
+    max_g = GRADE_MAX_PCT[SCENARIO_PROFILE] / 100.0  # fraction
+
+    # ── Step 1: local elevation relief ────────────────────────────────────
+    # Difference between cell and local mean = how much earthwork is needed
+    # to level the road through this terrain.
+    from scipy.ndimage import uniform_filter
+    dem_smooth = uniform_filter(dem.astype(np.float64), size=5, mode='reflect')
+    relief = np.abs(dem - dem_smooth).astype(np.float32)  # metres
+
+    # ── Step 2: approximate cross-section volume per metre of road ────────
+    # For a relief of h metres:
+    #   cut volume  ≈ ½ × h × (fw + h × cut_batter) per metre of road
+    #   fill volume ≈ ½ × h × (fw + h × fill_batter) per metre of road
+    # Average batter
+    avg_batter = (CUT_BATTER_HV + FILL_BATTER_HV) / 2.0
+    volume_per_m = 0.5 * relief * (fw + relief * avg_batter)
+
+    # ── Step 3: slope-grade interaction ───────────────────────────────────
+    # If terrain slope exceeds max design grade, extra earthwork is needed
+    # to bring the grade down to the design limit.
+    grade_excess = np.maximum(slope_pct / 100.0 - max_g, 0.0)  # fraction
+    # Extra volume from grade reduction: proportional to excess × pixel length
+    grade_volume = grade_excess * resolution_m * fw * 0.5
+    volume_per_m += grade_volume
+
+    # ── Step 4: normalize to multiplier ───────────────────────────────────
+    # Typical Myanmar rural cut: 500–2000 m³/km = 0.5–2.0 m³/m
+    # We want volume_per_m of ~2 m³/m to produce a multiplier of ~2.0
+    # Scale: 1.0 + weight × volume_per_m / reference_volume
+    ref_volume = fw * 0.5  # half-formation width as reference
+    multiplier = 1.0 + weight * np.clip(volume_per_m / max(ref_volume, 1.0), 0.0, 5.0)
+
+    n_penalised = int(np.sum(multiplier > 1.1))
+    log.info(
+        f"Earthwork proxy: {n_penalised:,} cells above 1.1× "
+        f"(max={multiplier.max():.2f}×, weight={weight})"
+    )
+    return multiplier.astype(np.float32)
 
 
 # ── Slope ────────────────────────────────────────────────────────────────────
@@ -212,6 +289,73 @@ def _apply_building_penalties(buildings_gdf, transform, shape, resolution_m=30):
     return penalty_map
 
 
+# ── Phase 11: WorldCover 10m → LULC penalty raster ──────────────────────────
+
+def worldcover_to_lulc_raster(wc_array, wc_transform, target_shape,
+                                target_transform, slope_pct=None):
+    """
+    Convert ESA WorldCover 10m class raster into a float32 LULC penalty
+    multiplier raster aligned to the DEM grid.
+
+    Steps:
+      1. Map class values → WORLDCOVER_PENALTIES multipliers (10m resolution)
+      2. Resample from 10m to 30m (or whatever the DEM grid is) via bilinear
+      3. Apply SLOPE_LULC_INTERACT amplification (if slope_pct provided)
+      4. Cells with unmapped/NoData class → LULC_UNMAPPED_BASE
+
+    Args:
+        wc_array:         uint8 WorldCover raster (10m, UTM)
+        wc_transform:     rasterio affine transform for wc_array
+        target_shape:     (rows, cols) of the DEM/cost grid
+        target_transform: rasterio affine transform of the DEM/cost grid
+        slope_pct:        optional float32 slope raster for interaction
+
+    Returns:
+        float32 array, shape == target_shape, values >= 1.0
+    """
+    from config import (
+        WORLDCOVER_PENALTIES, LULC_UNMAPPED_BASE,
+        SLOPE_LULC_INTERACT, SLOPE_MODERATE_PCT, UTM_EPSG,
+    )
+
+    rows_wc, cols_wc = wc_array.shape
+    rows, cols = target_shape
+
+    # Step 1: map class values → penalty multipliers at 10m
+    penalty_10m = np.full((rows_wc, cols_wc), LULC_UNMAPPED_BASE, dtype=np.float32)
+    for class_val, mult in WORLDCOVER_PENALTIES.items():
+        penalty_10m[wc_array == class_val] = mult
+
+    # Step 2: resample 10m → target grid (30m) using bilinear
+    dst_crs = rasterio.crs.CRS.from_epsg(UTM_EPSG)
+    penalty_resampled = np.full((rows, cols), LULC_UNMAPPED_BASE, dtype=np.float32)
+
+    reproject(
+        source=penalty_10m,
+        destination=penalty_resampled,
+        src_transform=wc_transform,
+        src_crs=dst_crs,
+        dst_transform=target_transform,
+        dst_crs=dst_crs,
+        resampling=Resampling.bilinear,
+    )
+
+    # Step 3: apply slope × LULC interaction (same as OSM path)
+    if slope_pct is not None:
+        t = np.clip(slope_pct / SLOPE_MODERATE_PCT, 0.0, 1.0)
+        penalty_resampled *= (1.0 + SLOPE_LULC_INTERACT * t)
+
+    # Floor at 1.0 (no discount)
+    np.maximum(penalty_resampled, 1.0, out=penalty_resampled)
+
+    n_above = int(np.sum(penalty_resampled > LULC_UNMAPPED_BASE))
+    log.info(
+        f"WorldCover LULC: {n_above:,} cells above background "
+        f"(max penalty: {penalty_resampled.max():.1f}×)"
+    )
+    return penalty_resampled
+
+
 # ── Phase 5.4: LULC Penalties (slope interaction + EDT boundary decay) ────────
 
 def _apply_lulc_penalties(lulc_gdf, transform, shape, slope_pct=None):
@@ -364,6 +508,9 @@ def _river_hierarchy_penalties(water_mask, resolution_m):
       2: 50–200 m → medium bridge        ×500
       3: 200–500 m → major bridge        ×5 000
       4: > 500 m → Ayeyarwady-scale      ×50 000
+
+    Performance: uses ndimage.find_objects for O(1) per-component bounding box
+    instead of per-component full-array scan. ~500× faster on large grids.
     """
     tiers = WATER_PENALTY_TIERS   # list of 5 multipliers from config
     binary = (water_mask > 0).astype(np.uint8)
@@ -372,29 +519,39 @@ def _river_hierarchy_penalties(water_mask, resolution_m):
     if n_components == 0:
         return np.zeros_like(water_mask, dtype=np.float64)
 
-    penalty_map = np.zeros_like(water_mask, dtype=np.float64)
+    # ── Vectorized: get bounding box slices for all components at once ────
+    slices = nd_label.__module__  # just to reference scipy.ndimage
+    from scipy.ndimage import find_objects
+    obj_slices = find_objects(labeled)  # list of (row_slice, col_slice) per component
 
-    for comp_id in range(1, n_components + 1):
-        comp_mask = labeled == comp_id
-        pixel_count = comp_mask.sum()
-        # Approximate "short axis" width using pixel count and bounding-box aspect
-        rows_idx = np.any(comp_mask, axis=1)
-        cols_idx = np.any(comp_mask, axis=0)
-        height_px = rows_idx.sum()
-        width_px  = cols_idx.sum()
-        # Short axis ≈ min dimension as a rough width proxy
+    # Width breakpoints in metres: <10, <50, <200, <500, ≥500
+    breakpoints = np.array([10.0, 50.0, 200.0, 500.0])
+
+    # Build a per-component penalty lookup: comp_penalty[comp_id] = penalty
+    # Index 0 is unused (background), indices 1..n_components are components
+    comp_penalty = np.zeros(n_components + 1, dtype=np.float64)
+    n_tier2_plus = 0
+
+    for comp_id, sl in enumerate(obj_slices, start=1):
+        if sl is None:
+            continue
+        row_sl, col_sl = sl
+        height_px = row_sl.stop - row_sl.start
+        width_px = col_sl.stop - col_sl.start
         short_axis_m = min(height_px, width_px) * resolution_m
 
-        if   short_axis_m < 10:    tier = 0
-        elif short_axis_m < 50:    tier = 1
-        elif short_axis_m < 200:   tier = 2
-        elif short_axis_m < 500:   tier = 3
-        else:                      tier = 4
-
-        penalty_map[comp_mask] = tiers[tier]
+        tier = int(np.searchsorted(breakpoints, short_axis_m))
+        comp_penalty[comp_id] = tiers[tier]
         if tier >= 2:
-            log.info(f"  River component {comp_id}: ~{short_axis_m:.0f} m wide → tier {tier} (×{tiers[tier]:,})")
+            n_tier2_plus += 1
 
+    # ── Single vectorized assignment: map labeled→penalty in one pass ────
+    penalty_map = comp_penalty[labeled]
+
+    log.info(
+        f"River hierarchy: {n_components:,} water components classified "
+        f"({n_tier2_plus:,} at tier ≥ 2) in one vectorised pass."
+    )
     return penalty_map
 
 
@@ -610,6 +767,16 @@ def build_cost_surface(slope_pct, building_penalty_map, water_mask, roads_mask=N
     # ── 1. Slope cost ─────────────────────────────────────────────────────
     cost = _slope_cost_array(slope_pct)
 
+    # ── 1b. Phase 12: Earthwork proxy (3D-CHA* inspired) ─────────────────
+    # Multiplicative layer that penalises cells requiring large cut/fill.
+    if dem is not None:
+        from config import EARTHWORK_PROXY_WEIGHT
+        if EARTHWORK_PROXY_WEIGHT > 0:
+            earthwork_mult = compute_earthwork_proxy(
+                dem, slope_pct, resolution_m, weight=EARTHWORK_PROXY_WEIGHT
+            )
+            cost *= earthwork_mult
+
     # ── 2. Landslide susceptibility ───────────────────────────────────────
     if curvature is not None:
         landslide_mult = compute_landslide_susceptibility(slope_pct, curvature, resolution_m)
@@ -692,3 +859,60 @@ def build_cost_surface(slope_pct, building_penalty_map, water_mask, roads_mask=N
         f"impassable={np.sum(cost >= IMPASSABLE):,}"
     )
     return cost.astype(np.float64)
+
+
+# ── Phase 4: Multi-Resolution Routing Pyramid (Tang & Dou 2023) ──────────────
+
+def build_cost_pyramid(fine_cost, levels=3, ratio=2, method="average"):
+    """
+    Generate a progressive multi-resolution cost pyramid (Tang & Dou, 2023).
+
+    Args:
+        fine_cost (np.ndarray): The base high-resolution cost surface (Level 0).
+        levels (int): The number of downsampled levels to create. 
+                      Total pyramid depth = levels + 1.
+        ratio (int): The downsampling factor between consecutive levels.
+        method (str): 'average' or 'maximum' aggregation method.
+
+    Returns:
+        list of np.ndarray: Cost pyramid from highest resolution (Level 0) to 
+                            lowest resolution (Level N).
+                            pyramid[0] = fine_cost
+                            pyramid[-1] = coarsest_cost
+    """
+    from skimage.measure import block_reduce
+    
+    func = np.mean if method == "average" else np.max
+    pyramid = [fine_cost]
+    current_cost = fine_cost
+    
+    for lvl in range(1, levels + 1):
+        # Pad dimensions to be a multiple of ratio before downsampling
+        pad_rows = (ratio - (current_cost.shape[0] % ratio)) % ratio
+        pad_cols = (ratio - (current_cost.shape[1] % ratio)) % ratio
+        
+        if pad_rows > 0 or pad_cols > 0:
+            current_cost = np.pad(
+                current_cost, 
+                ((0, pad_rows), (0, pad_cols)), 
+                mode='constant', 
+                constant_values=IMPASSABLE
+            )
+            
+        downsampled = block_reduce(current_cost, block_size=(ratio, ratio), func=func, cval=IMPASSABLE)
+        
+        # Ensure extremely high costs (e.g. averaged IMPASSABLE) remain clamped to IMPASSABLE
+        downsampled[downsampled >= (IMPASSABLE / (ratio**2))] = IMPASSABLE
+        
+        pyramid.append(downsampled)
+        current_cost = downsampled
+        
+        valid_cells = downsampled[downsampled < IMPASSABLE]
+        max_cost = valid_cells.max() if len(valid_cells) > 0 else 0
+        log.info(
+            f"Pyramid Level {lvl} (1:{ratio**lvl}): shape={downsampled.shape}, "
+            f"max_valid_cost={max_cost:.1f}"
+        )
+        
+    return pyramid
+

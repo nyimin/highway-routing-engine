@@ -432,6 +432,7 @@ def fetch_osm_layers(bbox_wgs84):
         cache_water,
         {"natural": ["water", "wetland"], "waterway": True},
         "water / waterways", "water", "water_from_cache",
+        retain_tags=["name", "waterway", "natural"]
     )
     roads = _load_or_fetch(
         cache_roads,
@@ -516,3 +517,315 @@ def derive_stream_mask_utm(dem_utm, transform_utm, resolution_m=30):
     stream = derive_stream_network(dem_utm, transform_utm, resolution_m)
     log.info("DEM-derived stream mask applied as water_mask substitute.")
     return stream
+
+
+# ── Phase 11: ESA WorldCover 10m ─────────────────────────────────────────────
+
+def fetch_worldcover(bbox_wgs84):
+    """
+    Fetch ESA WorldCover 10m land cover from Microsoft Planetary Computer.
+
+    Returns (lulc_array, utm_transform) where lulc_array is a uint8 raster
+    with ESA class values (10=Tree, 20=Shrub, 30=Grass, 40=Crop, 50=Built,
+    60=Bare, 70=Snow, 80=Water, 90=Wetland, 95=Mangrove, 100=Moss).
+
+    Returns (None, None) if the fetch fails (caller should fall back to OSM).
+    """
+    _ensure_data_dir()
+    key = _bbox_key(bbox_wgs84)
+    cache_utm = os.path.join(DATA_DIR, f"worldcover_utm_{key}.tif")
+
+    # Check cache first
+    if os.path.exists(cache_utm):
+        log.info(f"Loading cached WorldCover: {cache_utm}")
+        with rasterio.open(cache_utm) as src:
+            return src.read(1), src.transform
+
+    try:
+        from pystac_client import Client
+        import planetary_computer as pc
+    except ImportError:
+        try:
+            from pystac_client import Client
+        except ImportError:
+            log.warning("pystac-client not installed — cannot fetch WorldCover.")
+            return None, None
+        pc = None  # planetary_computer is optional for signing
+
+    west, south, east, north = [float(v) for v in bbox_wgs84]
+
+    try:
+        log.info("Querying Planetary Computer for ESA WorldCover 10m …")
+        catalog = Client.open(
+            "https://planetarycomputer.microsoft.com/api/stac/v1"
+        )
+
+        search = catalog.search(
+            collections=["esa-worldcover"],
+            bbox=[west, south, east, north],
+            query={"esa_worldcover:product_version": {"eq": "v200"}},
+        )
+
+        items = list(search.items())
+        if not items:
+            # Try without version filter
+            search = catalog.search(
+                collections=["esa-worldcover"],
+                bbox=[west, south, east, north],
+            )
+            items = list(search.items())
+
+        if not items:
+            log.warning("No WorldCover tiles found for this bounding box.")
+            return None, None
+
+        log.info(f"WorldCover: found {len(items)} tile(s). Reading …")
+
+        # Sign URLs if planetary_computer is available
+        if pc is not None:
+            items = [pc.sign(item) for item in items]
+
+        # Read and mosaic tiles using rioxarray
+        try:
+            import rioxarray  # noqa: F811
+            import xarray as xr
+
+            datasets = []
+            for item in items:
+                asset = item.assets.get("map") or list(item.assets.values())[0]
+                href = asset.href
+                ds = rioxarray.open_rasterio(href, chunks="auto")
+                datasets.append(ds)
+
+            if len(datasets) == 1:
+                merged = datasets[0]
+            else:
+                merged = xr.concat(datasets, dim="band")
+
+            # Clip to bounding box (WGS-84)
+            clipped = merged.rio.clip_box(
+                minx=west, miny=south, maxx=east, maxy=north
+            )
+
+            # Reproject to UTM
+            from config import UTM_EPSG
+            reprojected = clipped.rio.reproject(f"EPSG:{UTM_EPSG}")
+
+            # Extract numpy array and transform
+            lulc_arr = reprojected.values
+            if lulc_arr.ndim == 3:
+                lulc_arr = lulc_arr[0]  # (band, row, col) → (row, col)
+            lulc_arr = lulc_arr.astype(np.uint8)
+            utm_tf = reprojected.rio.transform()
+
+            # Cache to disk
+            rows_wc, cols_wc = lulc_arr.shape
+            with rasterio.open(
+                cache_utm, "w", driver="GTiff",
+                height=rows_wc, width=cols_wc, count=1,
+                dtype="uint8",
+                crs=f"EPSG:{UTM_EPSG}",
+                transform=utm_tf,
+                compress="deflate",
+            ) as dst:
+                dst.write(lulc_arr, 1)
+
+            log.info(
+                f"WorldCover: {rows_wc}×{cols_wc} raster at 10m cached → {cache_utm}"
+            )
+            return lulc_arr, utm_tf
+
+        except Exception as exc:
+            log.warning(f"rioxarray WorldCover read failed ({exc}). Trying rasterio fallback …")
+            # Fallback: direct rasterio windowed read
+            item = items[0]
+            asset = item.assets.get("map") or list(item.assets.values())[0]
+            href = asset.href
+
+            with rasterio.open(href) as src:
+                # Compute the window for our bounding box
+                from rasterio.windows import from_bounds as window_from_bounds
+                window = window_from_bounds(west, south, east, north, src.transform)
+                lulc_wgs = src.read(1, window=window).astype(np.uint8)
+                wgs_tf = src.window_transform(window)
+                wgs_crs = src.crs
+                wgs_h, wgs_w = lulc_wgs.shape
+
+            # Reproject to UTM
+            from config import UTM_EPSG
+            dst_crs = rasterio.crs.CRS.from_epsg(UTM_EPSG)
+            from rasterio.warp import calculate_default_transform as calc_tf
+            utm_tf, utm_w, utm_h = calc_tf(
+                wgs_crs, dst_crs, wgs_w, wgs_h,
+                left=west, bottom=south, right=east, top=north,
+            )
+            lulc_utm = np.zeros((utm_h, utm_w), dtype=np.uint8)
+            reproject(
+                source=lulc_wgs, destination=lulc_utm,
+                src_transform=wgs_tf, src_crs=wgs_crs,
+                dst_transform=utm_tf, dst_crs=dst_crs,
+                resampling=Resampling.nearest,
+            )
+
+            with rasterio.open(
+                cache_utm, "w", driver="GTiff",
+                height=utm_h, width=utm_w, count=1,
+                dtype="uint8", crs=dst_crs, transform=utm_tf,
+                compress="deflate",
+            ) as dst:
+                dst.write(lulc_utm, 1)
+
+            log.info(f"WorldCover (rasterio fallback): {utm_h}×{utm_w} cached → {cache_utm}")
+            return lulc_utm, utm_tf
+
+    except Exception as exc:
+        log.warning(f"WorldCover fetch failed ({exc}). Falling back to OSM LULC.")
+        return None, None
+
+
+# ── Phase 11: Overture Maps Buildings ─────────────────────────────────────────
+
+def fetch_overture_buildings(bbox_wgs84):
+    """
+    Fetch building footprints from Overture Maps (Meta/Microsoft ML-derived).
+
+    Returns a GeoDataFrame in WGS-84 CRS, or an empty GeoDataFrame on failure.
+    These have dramatically better rural Myanmar coverage than OSM alone.
+    """
+    _ensure_data_dir()
+    key = _bbox_key(bbox_wgs84)
+    cache_path = os.path.join(DATA_DIR, f"overture_buildings_{key}.gpkg")
+
+    if os.path.exists(cache_path):
+        try:
+            gdf = gpd.read_file(cache_path)
+            log.info(f"Loaded cached Overture buildings: {len(gdf)} footprints")
+            return gdf
+        except Exception as exc:
+            log.warning(f"Overture cache read failed ({exc}), re-downloading.")
+
+    try:
+        import overturemaps
+    except ImportError:
+        log.warning("overturemaps not installed — cannot fetch Overture data.")
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    west, south, east, north = [float(v) for v in bbox_wgs84]
+    bbox = (west, south, east, north)
+
+    # Overture S3 buckets are public — ensure unsigned requests
+    import os as _os
+    _os.environ.setdefault("AWS_NO_SIGN_REQUEST", "true")
+
+    max_retries = 3
+    for attempt in range(1, max_retries + 1):
+        try:
+            log.info(f"Fetching Overture Maps buildings from S3 (attempt {attempt}/{max_retries}) …")
+            reader = overturemaps.record_batch_reader("building", bbox=bbox)
+            table = reader.read_all()
+
+            # Convert Arrow table → GeoDataFrame
+            import pyarrow as pa  # bundled with overturemaps
+
+            # Overture schema has a 'geometry' column in WKB format
+            df = table.to_pandas()
+            if "geometry" in df.columns:
+                from shapely import wkb
+                df["geometry"] = df["geometry"].apply(
+                    lambda g: wkb.loads(g) if isinstance(g, (bytes, bytearray)) else g
+                )
+                gdf = gpd.GeoDataFrame(df, geometry="geometry", crs="EPSG:4326")
+            else:
+                log.warning("Overture buildings table has no geometry column.")
+                return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+            # Keep only relevant columns
+            keep_cols = ["geometry"]
+            for c in ["height", "num_floors", "class", "subtype"]:
+                if c in gdf.columns:
+                    keep_cols.append(c)
+            gdf = gdf[keep_cols].copy().reset_index(drop=True)
+
+            gdf.to_file(cache_path, driver="GPKG")
+            log.info(f"Overture buildings: {len(gdf)} footprints fetched and cached.")
+            return gdf
+
+        except Exception as exc:
+            if attempt < max_retries:
+                wait = 2 ** attempt  # 2, 4 seconds
+                log.warning(
+                    f"Overture attempt {attempt} failed ({exc}). "
+                    f"Retrying in {wait}s …"
+                )
+                import time
+                time.sleep(wait)
+            else:
+                log.warning(f"Overture buildings fetch failed after {max_retries} attempts ({exc}). Using OSM only.")
+                return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+
+def merge_building_sources(osm_buildings, overture_buildings, dedup_radius_m=15.0):
+    """
+    Merge OSM and Overture building footprints with spatial deduplication.
+
+    Overture buildings whose centroid is within dedup_radius_m of any OSM
+    building centroid are dropped (assumed duplicate).  Remaining Overture
+    buildings are appended.
+
+    Args:
+        osm_buildings:      GeoDataFrame in UTM CRS
+        overture_buildings: GeoDataFrame in WGS-84 CRS (will be reprojected)
+        dedup_radius_m:     deduplication radius in metres
+
+    Returns:
+        Merged GeoDataFrame in UTM CRS.
+    """
+    if overture_buildings is None or len(overture_buildings) == 0:
+        log.info("No Overture buildings to merge — using OSM only.")
+        return osm_buildings
+
+    if osm_buildings is None or len(osm_buildings) == 0:
+        log.info("No OSM buildings — using Overture only.")
+        from config import UTM_EPSG
+        return overture_buildings.to_crs(epsg=UTM_EPSG)
+
+    from config import UTM_EPSG
+
+    # Reproject Overture to UTM
+    ov_utm = overture_buildings.to_crs(epsg=UTM_EPSG)
+
+    # Compute centroids for spatial deduplication
+    osm_centroids = osm_buildings.geometry.centroid
+    ov_centroids = ov_utm.geometry.centroid
+
+    # Build spatial index on OSM centroids for fast nearest-neighbour lookup
+    from shapely import STRtree
+    tree = STRtree(osm_centroids.values)
+
+    # For each Overture centroid, find nearest OSM centroid distance
+    keep_mask = np.ones(len(ov_utm), dtype=bool)
+    for i, ov_c in enumerate(ov_centroids):
+        nearest_idx = tree.nearest(ov_c)
+        nearest_osm = osm_centroids.iloc[nearest_idx]
+        dist = ov_c.distance(nearest_osm)
+        if dist < dedup_radius_m:
+            keep_mask[i] = False
+
+    n_dedup = int((~keep_mask).sum())
+    ov_new = ov_utm[keep_mask].copy()
+
+    # Ensure schema compatibility — keep only geometry column
+    ov_new = ov_new[["geometry"]].copy()
+    osm_clean = osm_buildings[["geometry"]].copy() if "geometry" in osm_buildings.columns else osm_buildings
+
+    import pandas as pd
+    merged = gpd.GeoDataFrame(
+        pd.concat([osm_clean, ov_new], ignore_index=True),
+        crs=f"EPSG:{UTM_EPSG}"
+    )
+
+    log.info(
+        f"Buildings merged: {len(osm_buildings)} OSM + {len(ov_new)} Overture "
+        f"({n_dedup} duplicates removed) = {len(merged)} total"
+    )
+    return merged

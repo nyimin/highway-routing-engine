@@ -77,18 +77,125 @@ class StructureInventory:
     culvert_count: int
 
 
+# ── Step 0: Filter water features to bridge-worthy subset ─────────────────────
+
+def filter_bridge_worthy_water(water_utm):
+    """
+    Filter water_utm GeoDataFrame to retain only features that could
+    realistically require a bridge.
+
+    Exclusions (Myanmar low-quality OSM context):
+      1. Non-polygon geometries (LineString waterways are centrelines, not
+         water surface area; Points are gauge stations).
+      2. natural=wetland (seasonally saturated land, not a waterway).
+      3. Non-crossable waterway tags (dams, weirs, fish ponds, docks, ditches).
+      4. Polygons smaller than BRIDGE_MIN_WATER_AREA_M2.
+
+    Retained features:
+      - natural=water polygons (rivers, lakes, reservoirs) ≥ min area
+      - Polygons with waterway in BRIDGE_WORTHY_WATERWAY_TAGS
+    """
+    if water_utm is None or len(water_utm) == 0:
+        return water_utm
+
+    try:
+        from config import (
+            BRIDGE_WORTHY_WATERWAY_TAGS, BRIDGE_EXCLUDE_WATERWAY_TAGS,
+            BRIDGE_EXCLUDE_NATURAL_TAGS, BRIDGE_MIN_WATER_AREA_M2,
+        )
+    except ImportError:
+        log.warning("Structures: could not import bridge filter config — using unfiltered water.")
+        return water_utm
+
+    n_before = len(water_utm)
+
+    # 1. Keep only Polygon / MultiPolygon geometries
+    mask_poly = water_utm.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+
+    # 2. Exclude natural=wetland
+    mask_natural_ok = True  # default: keep
+    if "natural" in water_utm.columns:
+        nat_vals = water_utm["natural"].fillna("")
+        mask_natural_ok = ~nat_vals.isin(BRIDGE_EXCLUDE_NATURAL_TAGS)
+
+    # 3. Exclude non-crossable waterway tags
+    mask_waterway_ok = True  # default: keep
+    if "waterway" in water_utm.columns:
+        ww_vals = water_utm["waterway"].fillna("")
+        mask_waterway_ok = ~ww_vals.isin(BRIDGE_EXCLUDE_WATERWAY_TAGS)
+
+    # Combined mask
+    mask = mask_poly & mask_natural_ok & mask_waterway_ok
+    filtered = water_utm[mask].copy()
+
+    # 4. Minimum polygon area filter
+    if len(filtered) > 0:
+        areas = filtered.geometry.area
+        filtered = filtered[areas >= BRIDGE_MIN_WATER_AREA_M2].copy()
+
+    n_after = len(filtered)
+    log.info(
+        f"Structures: bridge-worthy water filter: {n_before} → {n_after} features "
+        f"(removed {n_before - n_after}: non-polygon, wetland, dam/weir, small ponds)"
+    )
+    return filtered.reset_index(drop=True)
+
+
+# ── Step 0b: Crossing angle validation ────────────────────────────────────────
+
+def _crossing_angle_deg(route_ls, seg, water_geom):
+    """
+    Compute the angle (degrees) between the route direction at a crossing
+    and the longest axis of the water polygon.
+
+    Returns a value in [0, 90]. High = perpendicular (good bridge crossing).
+    Low = parallel (route running alongside, false positive).
+    """
+    # Route direction at intersection midpoint
+    mid_frac = route_ls.project(seg.interpolate(0.5, normalized=True), normalized=True)
+    eps = 0.001
+    p1 = route_ls.interpolate(max(0.0, mid_frac - eps), normalized=True)
+    p2 = route_ls.interpolate(min(1.0, mid_frac + eps), normalized=True)
+    route_dx = p2.x - p1.x
+    route_dy = p2.y - p1.y
+
+    # Water body longest axis (from minimum rotated rectangle)
+    try:
+        rect = water_geom.minimum_rotated_rectangle
+        coords = list(rect.exterior.coords)
+        # Compute the two edge vectors of the rectangle
+        e1 = (coords[1][0] - coords[0][0], coords[1][1] - coords[0][1])
+        e2 = (coords[2][0] - coords[1][0], coords[2][1] - coords[1][1])
+        # Longest edge is the 'major axis'
+        l1 = math.hypot(*e1)
+        l2 = math.hypot(*e2)
+        water_dx, water_dy = e1 if l1 >= l2 else e2
+    except Exception:
+        return 90.0  # If geometry is degenerate, assume perpendicular (allow)
+
+    # Angle between vectors (absolute, mapped to [0, 90])
+    denom = math.hypot(route_dx, route_dy) * math.hypot(water_dx, water_dy)
+    if denom < 1e-9:
+        return 90.0
+    cos_angle = abs(route_dx * water_dx + route_dy * water_dy) / denom
+    cos_angle = min(1.0, cos_angle)  # clamp for numerical safety
+    angle_deg = math.degrees(math.acos(cos_angle))
+    return angle_deg   # 0 = parallel, 90 = perpendicular
+
+
 # ── Step 1: Find water crossings using route–water intersection ───────────────
 
 def _find_water_crossings(smooth_utm, water_utm, va_result):
     """
-    Intersect the alignment LineString with water body geometries.
+    Intersect the alignment LineString with bridge-worthy water body polygons.
+
+    Pre-filters water_utm to real rivers/canals only (excludes wetlands,
+    LineString waterways, dams, fish ponds, tiny polygons).
+    Validates crossing angle to reject false positives from parallel overlaps.
 
     Returns list of dicts:
         {start_m, end_m, mid_m, length_m, water_name}
     where x_m are chainages along the alignment.
-
-    Falls back to an empty list if Shapely or GeoPandas are unavailable
-    or if water_utm is None/empty.
     """
     if water_utm is None:
         log.info("Structures: no water data — skipping bridge detection.")
@@ -99,6 +206,12 @@ def _find_water_crossings(smooth_utm, water_utm, va_result):
         n_water = 0
     if n_water == 0:
         log.info("Structures: water layer is empty — skipping bridge detection.")
+        return []
+
+    # Phase 8b: filter to bridge-worthy water features (real rivers only)
+    water_utm = filter_bridge_worthy_water(water_utm)
+    if water_utm is None or len(water_utm) == 0:
+        log.info("Structures: no bridge-worthy water after filtering — 0 bridges.")
         return []
 
     try:
@@ -137,9 +250,25 @@ def _find_water_crossings(smooth_utm, water_utm, va_result):
         elif inter.geom_type in ("MultiLineString", "GeometryCollection"):
             segs = [g for g in inter.geoms if g.geom_type == "LineString"]
 
+        # Phase 8b: import crossing angle threshold
+        try:
+            from config import BRIDGE_MIN_CROSSING_ANGLE_DEG
+        except ImportError:
+            BRIDGE_MIN_CROSSING_ANGLE_DEG = 15.0
+
         for seg in segs:
             if seg.length < 1.0:
                 continue
+
+            # Phase 8b: crossing angle validation
+            angle = _crossing_angle_deg(route_ls, seg, geom)
+            if angle < BRIDGE_MIN_CROSSING_ANGLE_DEG:
+                log.debug(
+                    f"Structures: rejected crossing (angle={angle:.1f}° < "
+                    f"{BRIDGE_MIN_CROSSING_ANGLE_DEG}° — route parallel to water body)"
+                )
+                continue
+
             start_pt = seg.interpolate(0)
             end_pt   = seg.interpolate(seg.length)
             s_start  = pt_to_chainage(start_pt)

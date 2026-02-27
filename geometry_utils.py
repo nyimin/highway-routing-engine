@@ -15,7 +15,10 @@ from shapely.geometry import LineString, mapping
 from shapely.ops import unary_union
 from scipy.interpolate import splprep, splev
 
-from config import UTM_EPSG, MIN_CURVE_RADIUS, ROW_BUFFER_M, SLOPE_MAX_PCT, DESIGN_SPEED_KMPH
+from config import (
+    UTM_EPSG, MIN_CURVE_RADIUS, ROW_BUFFER_M, SLOPE_MAX_PCT, DESIGN_SPEED_KMPH,
+    MIN_TANGENT_LENGTH_M, MIN_CURVE_LENGTH_M,
+)
 
 log = logging.getLogger("highway_alignment")
 
@@ -268,6 +271,137 @@ def verify_curve_radius(coords_utm, min_radius=MIN_CURVE_RADIUS):
         log.info(f"Curve radius OK: min={min_r:.1f} m ≥ {min_radius} m [{DESIGN_SPEED_KMPH} km/h]")
 
     return min_r, violations
+
+
+# ── Phase 12: Design length verification (3D-CHA* inspired) ────────────────
+
+def verify_design_lengths(coords_utm, min_radius=MIN_CURVE_RADIUS,
+                          min_tangent_m=MIN_TANGENT_LENGTH_M,
+                          min_curve_m=MIN_CURVE_LENGTH_M):
+    """
+    Check that tangent and curve segments meet minimum design lengths.
+
+    Inspired by 3D-CHA* which enforces:
+      - MIN_LEN_TAN: shortest acceptable straight segment
+      - MIN_LEN_CURV: shortest acceptable circular curve
+
+    Short tangents between reverse curves create dangerous reverse-superelevation
+    transitions. Short curves give drivers insufficient time to perceive the
+    change in direction and adjust steering.
+
+    Classification:
+      - Curve segment: R < 5 × min_radius  (non-trivial curvature)
+      - Tangent segment: R ≥ 5 × min_radius (effectively straight)
+
+    Args:
+        coords_utm:     smoothed alignment as list of (x, y) tuples
+        min_radius:     minimum curve radius for classifying curves
+        min_tangent_m:  minimum tangent length (from config profile)
+        min_curve_m:    minimum curve length (from config profile)
+
+    Returns:
+        dict with:
+          tangent_violations: list of (start_station_m, length_m)
+          curve_violations:   list of (start_station_m, length_m, avg_radius_m)
+          n_tangents: total tangent segments
+          n_curves:   total curve segments
+    """
+    pts = coords_utm
+    n = len(pts)
+    if n < 3:
+        return {"tangent_violations": [], "curve_violations": [],
+                "n_tangents": 0, "n_curves": 0}
+
+    curve_threshold = 5.0 * min_radius
+
+    # classify each segment as curve or tangent
+    seg_types = []      # 'T' or 'C'
+    seg_radii = []      # radius for curves
+    seg_lengths = []    # segment length in metres
+    stations = [0.0]    # cumulative station for each point
+
+    for i in range(1, n):
+        d = math.hypot(pts[i][0] - pts[i-1][0], pts[i][1] - pts[i-1][1])
+        stations.append(stations[-1] + d)
+
+    for i in range(1, n - 1):
+        r = curve_radius_at_point(pts[i-1], pts[i], pts[i+1])
+        seg_len = stations[i+1] - stations[i-1]  # length over the triplet
+        if r < curve_threshold:
+            seg_types.append('C')
+            seg_radii.append(r)
+        else:
+            seg_types.append('T')
+            seg_radii.append(float('inf'))
+        seg_lengths.append(seg_len / 2.0)  # approximate per-point contribution
+
+    # group consecutive same-type segments
+    groups = []  # (type, start_station, length, [radii])
+    if not seg_types:
+        return {"tangent_violations": [], "curve_violations": [],
+                "n_tangents": 0, "n_curves": 0}
+
+    curr_type = seg_types[0]
+    curr_start = stations[1]
+    curr_len = seg_lengths[0]
+    curr_radii = [seg_radii[0]]
+
+    for j in range(1, len(seg_types)):
+        if seg_types[j] == curr_type:
+            curr_len += seg_lengths[j]
+            curr_radii.append(seg_radii[j])
+        else:
+            groups.append((curr_type, curr_start, curr_len, curr_radii))
+            curr_type = seg_types[j]
+            curr_start = stations[j + 1]
+            curr_len = seg_lengths[j]
+            curr_radii = [seg_radii[j]]
+    groups.append((curr_type, curr_start, curr_len, curr_radii))
+
+    # check violations
+    tangent_violations = []
+    curve_violations = []
+    n_tangents = 0
+    n_curves = 0
+
+    for gtype, gstart, glen, gradii in groups:
+        if gtype == 'T':
+            n_tangents += 1
+            if glen < min_tangent_m:
+                tangent_violations.append((round(gstart, 1), round(glen, 1)))
+        else:
+            n_curves += 1
+            avg_r = np.mean([r for r in gradii if r < float('inf')])
+            if glen < min_curve_m:
+                curve_violations.append((round(gstart, 1), round(glen, 1), round(avg_r, 1)))
+
+    # logging
+    if tangent_violations:
+        log.warning(
+            f"Design lengths: {len(tangent_violations)} tangent(s) below "
+            f"{min_tangent_m:.0f} m (min found: {min(v[1] for v in tangent_violations):.0f} m)"
+        )
+        for s, l in tangent_violations[:5]:
+            log.warning(f"  Station {s:.0f} m: tangent length {l:.0f} m")
+    else:
+        log.info(f"Tangent lengths OK: all {n_tangents} tangents ≥ {min_tangent_m:.0f} m")
+
+    if curve_violations:
+        log.warning(
+            f"Design lengths: {len(curve_violations)} curve(s) below "
+            f"{min_curve_m:.0f} m (min found: {min(v[1] for v in curve_violations):.0f} m)"
+        )
+        for s, l, r in curve_violations[:5]:
+            log.warning(f"  Station {s:.0f} m: curve length {l:.0f} m (R={r:.0f} m)")
+    else:
+        log.info(f"Curve lengths OK: all {n_curves} curves ≥ {min_curve_m:.0f} m")
+
+    return {
+        "tangent_violations": tangent_violations,
+        "curve_violations": curve_violations,
+        "n_tangents": n_tangents,
+        "n_curves": n_curves,
+    }
 
 
 # ── Longitudinal profile ──────────────────────────────────────────────────────

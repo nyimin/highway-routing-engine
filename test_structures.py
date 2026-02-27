@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from structures import (
     _z_at, _find_culvert_sites, build_structure_inventory,
-    _find_water_crossings,
+    _find_water_crossings, _filter_bridge_worthy_water,
 )
 
 
@@ -247,6 +247,106 @@ def test_culvert_spacing():
     print("  ✓ test_culvert_spacing")
 
 
+# ── Test 8: Wetland polygons NOT treated as bridges ──────────────────────────
+
+def test_wetland_not_bridged():
+    """
+    A natural=wetland polygon that the route crosses should produce 0 bridges.
+    Wetlands are saturated land — not waterways requiring a bridge.
+    """
+    try:
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+    except ImportError:
+        print("  ⚠ test_wetland_not_bridged: shapely/geopandas not available — skipped")
+        return
+
+    route = [(float(x), 0.0) for x in range(0, 10001, 100)]
+    va    = _make_va(n=len(route), length=10000.0)
+
+    # A wetland polygon that the route crosses
+    wetland = Polygon([(5000, -200), (5200, -200), (5200, 200), (5000, 200)])
+    water_gdf = gpd.GeoDataFrame(
+        {"geometry": [wetland], "name": ["test_wetland"],
+         "natural": ["wetland"], "waterway": [None]},
+        crs="EPSG:32647"
+    )
+
+    crossings = _find_water_crossings(route, water_gdf, va)
+    assert len(crossings) == 0, (
+        f"Wetland should NOT produce a bridge, got {len(crossings)} crossings"
+    )
+    print("  ✓ test_wetland_not_bridged")
+
+
+# ── Test 9: LineString waterways NOT treated as bridges ──────────────────────
+
+def test_linestring_not_bridged():
+    """
+    A LineString waterway (stream centreline) should produce 0 bridges.
+    LineStrings don't represent water surface area.
+    """
+    try:
+        import geopandas as gpd
+        from shapely.geometry import LineString
+    except ImportError:
+        print("  ⚠ test_linestring_not_bridged: shapely/geopandas not available — skipped")
+        return
+
+    route = [(float(x), 0.0) for x in range(0, 10001, 100)]
+    va    = _make_va(n=len(route), length=10000.0)
+
+    # A stream LineString that crosses the route
+    stream = LineString([(5000, -200), (5000, 200)])
+    water_gdf = gpd.GeoDataFrame(
+        {"geometry": [stream], "name": ["test_stream"],
+         "natural": [None], "waterway": ["stream"]},
+        crs="EPSG:32647"
+    )
+
+    crossings = _find_water_crossings(route, water_gdf, va)
+    assert len(crossings) == 0, (
+        f"LineString stream should NOT produce a bridge, got {len(crossings)} crossings"
+    )
+    print("  ✓ test_linestring_not_bridged")
+
+
+# ── Test 10: Real river polygon IS detected as bridge ─────────────────────────
+
+def test_real_river_bridged():
+    """
+    A natural=water polygon that the route crosses perpendicularly
+    at sufficient area should produce exactly 1 bridge.
+    """
+    try:
+        import geopandas as gpd
+        from shapely.geometry import Polygon
+    except ImportError:
+        print("  ⚠ test_real_river_bridged: shapely/geopandas not available — skipped")
+        return
+
+    route = [(float(x), 0.0) for x in range(0, 10001, 100)]
+    va    = _make_va(n=len(route), length=10000.0)
+
+    # A river polygon — route crosses perpendicularly (river runs N-S, route E-W)
+    # Area = 100m x 400m = 40,000 m² — well above the 500 m² minimum
+    river = Polygon([(5000, -200), (5100, -200), (5100, 200), (5000, 200)])
+    water_gdf = gpd.GeoDataFrame(
+        {"geometry": [river], "name": ["test_river"],
+         "natural": ["water"], "waterway": [None]},
+        crs="EPSG:32647"
+    )
+
+    crossings = _find_water_crossings(route, water_gdf, va)
+    assert len(crossings) == 1, (
+        f"Real river polygon should produce 1 bridge, got {len(crossings)}"
+    )
+    assert crossings[0]["length_m"] > 5.0, (
+        f"Bridge span should be > 5 m, got {crossings[0]['length_m']:.1f}"
+    )
+    print("  ✓ test_real_river_bridged")
+
+
 # ── Runner ────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -258,6 +358,9 @@ if __name__ == "__main__":
         test_close_crossings_merge,
         test_structure_sorting,
         test_culvert_spacing,
+        test_wetland_not_bridged,
+        test_linestring_not_bridged,
+        test_real_river_bridged,
     ]
     passed = 0
     print("\nPhase 8 — Bridge and Culvert Inventory Unit Tests")

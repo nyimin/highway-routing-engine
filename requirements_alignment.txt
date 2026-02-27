@@ -25,3 +25,17 @@ requests>=2.31
 folium>=0.15
 matplotlib>=3.8
 python-dotenv>=1.0
+
+# ── Phase 10: Feasibility Report ────────────────────────
+# HTML/PDF report generation
+jinja2>=3.1
+weasyprint>=60.0
+
+# ── Phase 11: Enhanced Data Sources ─────────────────────
+# ESA WorldCover 10m land cover (replaces incomplete OSM LULC)
+pystac-client>=0.7
+rioxarray>=0.15
+planetary-computer>=1.0
+
+# Overture Maps building footprints (ML-derived, better rural coverage)
+overturemaps>=0.5

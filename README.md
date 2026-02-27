@@ -5,7 +5,7 @@ It fetches elevation (DEM) and infrastructure data (OpenStreetMap), builds a
 multi-layer cost surface, runs two-resolution pathfinding, and exports
 engineering-grade GeoJSON outputs with a 10-product visualization suite.
 
-> **Current phase: 10** — parametric cost model and automated feasibility report complete (incorporating 3D VA, earthwork, and structures).
+> **Current phase: 14** — Tang & Dou (2023) Multi-Scale Least-Cost Path (MS-LCP) multi-resolution pyramid routing complete.
 
 ---
 
@@ -27,11 +27,11 @@ engineering-grade GeoJSON outputs with a 10-product visualization suite.
 
 ### Routing
 
-- **Two-resolution coarse-to-fine** — coarse Dijkstra/FMM at `COARSE_FACTOR×` resolution, then fine micro-routing inside an 8 km corridor band.
+- **Multi-Scale LCP (MS-LCP)** — progressive resolution cost pyramid, 45° directional waypoint extraction, and parallel segmented routing (based on Tang & Dou, 2023).
 - **Rubber-band centering** — distance-transform penalty prevents meandering; bounding-box-diagonal normalization avoids over-penalization in narrow corridors.
 - **Sub-pixel FMM gradient descent** — eliminates grid stair-step artifacts (Phase 5.3).
 - **Sharp-reversal filter** — removes near-180° waypoint stutters (configurable via `TURNING_ANGLE_FILTER_DEG`).
-- **Bridge siting** — identifies optimal crossing points for tiered rivers with minimum inter-bridge spacing.
+- **Bridge siting** — `multi_pass_routing` enables sequential point-to-point connections over $N$ consecutive bridge locations, explicitly forcing routing engines to bridge across all filtered major water bodies.
 - **Engine auto-selection**: `scikit-fmm` if available, otherwise Dijkstra.
 
 ### Geometry & Vertical Alignment (Phase 6)
@@ -166,7 +166,7 @@ The pipeline will:
 
 1. Download / cache DEM and OSM data.
 2. Build the multi-layer cost surface.
-3. Run coarse → fine routing and verify geometry.
+3. Run MS-LCP routed pathfinding and verify geometry.
 4. Compute 3D vertical alignment, earthwork volumes, and structure inventory.
 5. Compute the parametric cost model and generate the feasibility report.
 6. Export visuals, GeoJSON, CSVs, and the final HTML/PDF report.
@@ -181,17 +181,17 @@ The pipeline will:
 
 ## Configuration Reference
 
-| Constant                   | Default               | Description                            |
-| -------------------------- | --------------------- | -------------------------------------- |
-| `RESOLUTION`               | 30                    | Grid cell size (metres)                |
-| `COARSE_FACTOR`            | 10                    | Coarse-pass downsampling ratio         |
-| `CORRIDOR_BAND_KM`         | 8.0                   | Fine-routing corridor half-width (km)  |
-| `SLOPE_MAX_PCT`            | 12                    | Maximum design slope (%)               |
-| `SLOPE_CLIFF_PCT`          | 25                    | Impassable cliff threshold (%)         |
-| `TURNING_ANGLE_FILTER_DEG` | 160                   | Filter near-reversal waypoints (°)     |
-| `MEMORY_WARN_GB`           | 4.0                   | Auto-escalate coarse factor above this |
-| `WATER_PENALTY_TIERS`      | [5,50,500,5000,50000] | Per-tier river crossing multipliers    |
-| `ROAD_DISCOUNT`            | 0.5                   | Existing-road cost multiplier          |
+| Constant                   | Default               | Description                                    |
+| -------------------------- | --------------------- | ---------------------------------------------- |
+| `RESOLUTION`               | 30                    | Grid cell size (metres)                        |
+| `PYRAMID_LEVELS`           | 3                     | Number of downscaling levels for MS-LCP        |
+| `DOWNSAMPLE_RATIO`         | 2                     | Factor to downscale the cost surface per level |
+| `SLOPE_MAX_PCT`            | 12                    | Maximum design slope (%)                       |
+| `SLOPE_CLIFF_PCT`          | 25                    | Impassable cliff threshold (%)                 |
+| `TURNING_ANGLE_FILTER_DEG` | 160                   | Filter near-reversal waypoints (°)             |
+| `MEMORY_WARN_GB`           | 4.0                   | Auto-escalate coarse factor above this         |
+| `WATER_PENALTY_TIERS`      | [5,50,500,5000,50000] | Per-tier river crossing multipliers            |
+| `ROAD_DISCOUNT`            | 0.5                   | Existing-road cost multiplier                  |
 
 See `config.py` for the full list.
 
@@ -209,6 +209,12 @@ python test_structures.py
 python test_cost_model.py
 python test_report.py
 ```
+
+---
+
+## Known Issues
+
+- **`bridge_siting.py` is deprecated:** This script is rendered obsolete by the recent `multi_pass_routing` integration and structure detection logic. It is currently disconnected from the pipeline and remains in the codebase. Do not use it until it undergoes a complete architectural overhaul. (See `ISSUES.md`).
 
 ---
 

@@ -40,6 +40,10 @@ _PROFILES = {
         superelevation_max=0.08,
         rubber_band_macro_weight=0.05,
         rubber_band_micro_weight=0.01,
+        # Phase 12: 3D-CHA* inspired parameters
+        earthwork_proxy_weight=0.25,      # lower for flat expressway corridors
+        min_tangent_length_m=300.0,       # AASHTO at 100 km/h
+        min_curve_length_m=200.0,         # 3× superelevation run-off at 100 km/h
     ),
     # Rural/regional trunk (most Myanmar inter-city corridors)
     "rural_trunk": dict(
@@ -52,6 +56,10 @@ _PROFILES = {
         superelevation_max=0.08,
         rubber_band_macro_weight=0.03,
         rubber_band_micro_weight=0.005,
+        # Phase 12: 3D-CHA* inspired parameters
+        earthwork_proxy_weight=0.30,      # moderate — balance earthwork vs route length
+        min_tangent_length_m=200.0,       # Myanmar DRD rural trunk standard
+        min_curve_length_m=100.0,         # 3× superelevation run-off at 60 km/h
     ),
     # Mountain road (Chin Hills, eastern Shan, Kachin — switchbacks acceptable)
     "mountain_road": dict(
@@ -64,6 +72,10 @@ _PROFILES = {
         superelevation_max=0.10,
         rubber_band_macro_weight=0.02,
         rubber_band_micro_weight=0.003,
+        # Phase 12: 3D-CHA* inspired parameters
+        earthwork_proxy_weight=0.40,      # higher — earthwork dominates mountain cost
+        min_tangent_length_m=100.0,       # shorter tangents OK at low speed
+        min_curve_length_m=60.0,          # matches min_curve_radius arc at 40 km/h
     ),
 }
 
@@ -78,6 +90,9 @@ MIN_CURVE_RADIUS       = _p["min_curve_radius"]
 SUPERELEVATION_MAX     = _p["superelevation_max"]
 RUBBER_BAND_MACRO_W    = _p["rubber_band_macro_weight"]
 RUBBER_BAND_MICRO_W    = _p["rubber_band_micro_weight"]
+EARTHWORK_PROXY_WEIGHT = _p["earthwork_proxy_weight"]
+MIN_TANGENT_LENGTH_M   = _p["min_tangent_length_m"]
+MIN_CURVE_LENGTH_M     = _p["min_curve_length_m"]
 
 # ── Right-of-Way & Expropriation ──────────────────────────────────────────────
 # Phase 5.2: Industrial Standard Building Buffering
@@ -213,7 +228,7 @@ LULC_EDGE_DECAY_M = 150  # Distance over which penalty decays to 1.0 outside pol
 # Tier 2: medium river 50–200 m → medium bridge
 # Tier 3: large river 200–500 m → major bridge (Chindwin-scale)
 # Tier 4: navigation river >500 m → Ayeyarwady-scale; find narrowest crossing
-WATER_PENALTY_TIERS = [5, 50, 500, 5_000, 50_000]
+WATER_PENALTY_TIERS = [2, 5, 10, 20, 30]
 
 # Bridge constraints
 MIN_BRIDGE_SPACING_M = 10_000   # Minimum distance between two major bridge sites
@@ -225,14 +240,20 @@ WATER_PENALTY = 5_000
 IMPASSABLE   = 1e9
 BORDER_CELLS = 20
 
-# ── Phase 4: Two-Resolution Routing ───────────────────────────────────────────
-# Coarse pass downsamples the cost grid by COARSE_FACTOR before the first
-# Dijkstra run. Fine routing then only occurs inside a CORRIDOR_BAND_KM wide
-# band around the coarse route.  Reduces memory ~COARSE_FACTOR² and runtime.
+# ── Phase 4: Multi-Resolution Routing Pyramid (Tang & Dou 2023) ───────────────
+# Progressively downsamples the cost surface to create a multi-scale pyramid.
+# Routing occurs segment-by-segment between waypoints identified at coarser levels.
+PYRAMID_LEVELS            = 3          # Number of downsampling levels (e.g., 30m -> 60m -> 120m -> 240m)
+DOWNSAMPLE_RATIO          = 2          # Scale factor per level
+DOWNSAMPLE_METHOD         = "average"  # "average" or "maximum" (average recommended for mixed terrain)
+WAYPOINT_ANGLE_THRESH_DEG = 45.0       # Threshold for extracting directional waypoints
+PARALLEL_WAYPOINT_THRESH  = 4          # Min waypoints to spin up ProcessPoolExecutor
+
+# Legacy parameters retained for fallback compatibility
 COARSE_FACTOR     = 10         # 30 m × 10 = 300 m coarse resolution
 CORRIDOR_BAND_KM  = 8.0        # Half-width of fine-routing band (km each side)
 
-# FAST_MODE: 300 m resolution only (no fine pass) — for rapid scenario screening
+# FAST_MODE: Coarse resolution only — for rapid scenario screening
 FAST_MODE = False
 
 # Routing engine: 'dijkstra' (always available) or 'fmm' (requires scikit-fmm)
@@ -384,8 +405,76 @@ CULVERT_UNIT_COST_USD: float = 15_000.0
 # 200 cells → ~0.18 km² catchment → warrants a culvert.
 MIN_CULVERT_ACCUM_CELLS: int = 200
 
+# ── Phase 8b: Bridge Detection Filtering (Myanmar low-quality OSM context) ────
+#
+# Myanmar OSM water data contains many features that do NOT warrant a bridge:
+#   • natural=wetland — seasonally saturated land, not a waterway
+#   • LineString waterways (stream/river centrelines) — no real water surface
+#   • Dams, weirs, fish farming ponds, docks — not crossable water
+#   • Tiny unmapped ponds — below engineering significance
+#
+# Only polygon features representing real river/canal water surfaces trigger
+# bridge detection.  A crossing-angle check prevents false positives from
+# the route running parallel to a river inside its polygon.
+
+# Waterway tags that represent real crossable river water surfaces (polygon)
+BRIDGE_WORTHY_WATERWAY_TAGS: set = {"river", "riverbank", "canal"}
+
+# Waterway tags that are structures/facilities, NOT crossable water
+BRIDGE_EXCLUDE_WATERWAY_TAGS: set = {
+    "dam", "weir", "fish_farming_pond", "dock", "ditch", "drain",
+}
+
+# natural= tags that are NOT river water (wetlands are saturated land)
+BRIDGE_EXCLUDE_NATURAL_TAGS: set = {"wetland"}
+
+# Minimum water polygon area (m²) to warrant a bridge.
+# At 30 m resolution, a single cell ≈ 900 m²; 500 m² catches sub-cell ponds.
+BRIDGE_MIN_WATER_AREA_M2: float = 500.0
+
+# Minimum crossing angle (degrees) between route and water body longest axis.
+# Prevents false bridges from route running parallel inside a river polygon.
+# 15° = very acute; below this means "running alongside", not "crossing".
+BRIDGE_MIN_CROSSING_ANGLE_DEG: float = 15.0
+
 # Output paths for Phase 8
 OUTPUT_STRUCTURES_CSV: str = "output/structures.csv"
+
+# ── Phase 11: Enhanced Data Sources ───────────────────────────────────────────
+#
+# ESA WorldCover 10m — satellite-derived wall-to-wall land cover.
+# Replaces the incomplete OSM landuse/natural polygon layer for LULC penalties.
+# Accessed via Microsoft Planetary Computer STAC API (100% free, no API key).
+#
+# Class value → LULC cost multiplier mapping.
+# Values chosen to match existing LULC_PENALTIES semantics.
+WORLDCOVER_PENALTIES: dict[int, float] = {
+    10:  4.0,   # Tree cover → forest clearing + carbon offset
+    20:  1.5,   # Shrubland → scrub removal
+    30:  1.2,   # Grassland → minimal impact
+    40:  1.8,   # Cropland → agricultural compensation
+    50:  3.0,   # Built-up → urban penalty (supplements building layer)
+    60:  1.3,   # Bare / sparse vegetation → hard surface
+    70:  1.0,   # Snow and ice → N/A for Myanmar
+    80:  5.0,   # Permanent water bodies → water crossing penalty
+    90:  5.0,   # Herbaceous wetland → drainage + subgrade stabilisation
+    95:  6.0,   # Mangroves → extreme piling + ESG scrutiny
+    100: 1.5,   # Moss and lichen → similar to shrubland
+}
+
+# ── Data source preference flags ─────────────────────────────────────────────
+# True = use the enhanced (satellite/ML) source; False = use OSM-only (legacy).
+# If the enhanced source fetch fails, OSM is used as automatic fallback.
+USE_WORLDCOVER_LULC:    bool = True   # ESA WorldCover 10m for LULC
+USE_OVERTURE_BUILDINGS: bool = True   # Overture Maps ML building footprints
+
+# Microsoft Planetary Computer STAC API endpoint (ESA WorldCover)
+PLANETARY_COMPUTER_STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"
+
+# Overture Maps building deduplication radius (metres).
+# Overture buildings within this distance of an OSM building are dropped to avoid
+# double-counting.  15 m accounts for GPS drift + footprint alignment differences.
+OVERTURE_DEDUP_RADIUS_M: float = 15.0
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_DIR = "data"

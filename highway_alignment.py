@@ -781,8 +781,16 @@ def main():
             ] = 1.0
 
     # ── Step 9: Pathfinding ──────────────────────────────────────────────────
-    log.info("Running least-cost pathfinding …")
-    path_indices = find_path(cost, start_rc, end_rc)
+    log.info("Building cost pyramid and running multi-scale routing (MS-LCP) …")
+    from cost_surface import build_cost_pyramid
+    from routing import multi_scale_lcp
+    from config import PYRAMID_LEVELS, DOWNSAMPLE_RATIO, DOWNSAMPLE_METHOD
+
+    cost_pyramid = build_cost_pyramid(cost, PYRAMID_LEVELS, DOWNSAMPLE_RATIO, DOWNSAMPLE_METHOD)
+    path_indices = multi_scale_lcp(
+        cost_pyramid, start_rc, end_rc, water_mask, transform,
+        resolution_m=RESOLUTION, dem=dem
+    )
 
     # Convert indices → UTM coordinates
     path_utm = [rowcol_to_xy(r, c, transform) for r, c in path_indices]

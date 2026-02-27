@@ -47,20 +47,29 @@ from config import (
     OUTPUT_COST_CSV,
     # Phase 10
     OUTPUT_REPORT_HTML, OUTPUT_REPORT_PDF,
+    # Phase 11
+    USE_WORLDCOVER_LULC, USE_OVERTURE_BUILDINGS, OVERTURE_DEDUP_RADIUS_M,
 )
 from geometry_utils import (
     bbox_with_margin, wgs84_to_utm, utm_to_wgs84, xy_to_rowcol, rowcol_to_xy,
     smooth_path, verify_curve_radius, verify_row_setback, compute_metadata,
+    verify_design_lengths,
     export_geojson, export_geojson_3d,
     extract_longitudinal_profile, check_sustained_grade,
     compute_bearing, compute_clothoid_transitions,
 )
-from data_fetch import fetch_dem, fetch_osm_layers, derive_stream_mask_utm
+from data_fetch import (
+    fetch_dem, fetch_osm_layers, derive_stream_mask_utm,
+    fetch_worldcover, fetch_overture_buildings, merge_building_sources,
+)
 from cost_surface import (
     compute_slope, rasterise_layer, build_cost_surface,
     _slope_cost_array, _river_hierarchy_penalties,
+    worldcover_to_lulc_raster, build_cost_pyramid,
 )
-from routing import coarse_to_fine_routing
+from routing import multi_scale_lcp
+from config import PYRAMID_LEVELS, DOWNSAMPLE_RATIO, DOWNSAMPLE_METHOD
+from structures import filter_bridge_worthy_water
 
 log = logging.getLogger("highway_alignment")
 
@@ -207,7 +216,7 @@ def main():
         log.warning(
             f"Corridor {corridor_km:.0f} km exceeds TILE_ROUTING_THRESHOLD_KM="
             f"{TILE_ROUTING_THRESHOLD_KM:.0f} km. Consider enabling FAST_MODE or "
-            f"increasing COARSE_FACTOR for large-scale screening."
+            f"increasing PYRAMID_LEVELS for large-scale screening."
         )
     timer.stop()
 
@@ -239,9 +248,27 @@ def main():
     roads_utm     = to_utm(roads_wgs)
     lulc_utm      = to_utm(lulc_wgs)
 
-    if buildings_utm is not None and len(buildings_utm) > 0:
-        log.info(f"Loaded {len(buildings_utm)} buildings.")
+    # Harmonize: Pre-filter water polygons to only bridge-worthy rivers
+    # so the routing engine and the structure detector see the exact same rivers.
+    if water_utm is not None and len(water_utm) > 0:
+        water_utm = filter_bridge_worthy_water(water_utm)
 
+    if buildings_utm is not None and len(buildings_utm) > 0:
+        log.info(f"Loaded {len(buildings_utm)} OSM buildings.")
+
+    # ── 3b. Phase 11: Overture Maps buildings (supplement OSM) ────────────
+    if USE_OVERTURE_BUILDINGS:
+        overture_wgs = fetch_overture_buildings(bbox)
+        if overture_wgs is not None and len(overture_wgs) > 0:
+            buildings_utm = merge_building_sources(
+                buildings_utm, overture_wgs,
+                dedup_radius_m=OVERTURE_DEDUP_RADIUS_M,
+            )
+        else:
+            log.info("Overture buildings: none fetched — using OSM only.")
+
+    if buildings_utm is not None and len(buildings_utm) > 0:
+        log.info(f"Total buildings for penalty layer: {len(buildings_utm)}")
 
     # ── 4. Slope + curvature ───────────────────────────────────────────────
     log.info("Computing slope and curvature …")
@@ -269,16 +296,38 @@ def main():
     log.info("Rasterising roads_mask...")
     roads_mask    = rasterise_layer(roads_utm,     transform, (rows, cols))
     
-    # LULC is special because it has different categories. We'll pass the GDF directly
-    # or rasterise the penalties. Rasterising a single combined penalty map is best.
+    # ── 5b. Phase 11: LULC source selection (WorldCover vs OSM) ──────────
     lulc_penalty_map = np.ones((rows, cols), dtype=np.float32)
-    if lulc_utm is not None and len(lulc_utm) > 0:
-        log.info("Applying LULC penalties (slope interaction + EDT decay) ...")
-        from cost_surface import _apply_lulc_penalties
-        # Pass slope_pct so the slope×LULC interaction and EDT decay are applied.
-        lulc_penalty_map = _apply_lulc_penalties(
-            lulc_utm, transform, (rows, cols), slope_pct=slope_pct
-        )
+    lulc_source = "none"
+
+    if USE_WORLDCOVER_LULC:
+        log.info("Phase 11: Fetching ESA WorldCover 10m for LULC …")
+        wc_array, wc_transform = fetch_worldcover(bbox)
+        if wc_array is not None:
+            lulc_penalty_map = worldcover_to_lulc_raster(
+                wc_array, wc_transform,
+                target_shape=(rows, cols),
+                target_transform=transform,
+                slope_pct=slope_pct,
+            )
+            lulc_source = "WorldCover 10m"
+            log.info("LULC source: ESA WorldCover 10m (satellite-derived, wall-to-wall)")
+        else:
+            log.warning("WorldCover fetch failed — falling back to OSM LULC.")
+
+    if lulc_source == "none":
+        # Fallback: use OSM LULC polygons (legacy path)
+        if lulc_utm is not None and len(lulc_utm) > 0:
+            log.info("Applying LULC penalties from OSM (slope interaction + EDT decay) ...")
+            from cost_surface import _apply_lulc_penalties
+            lulc_penalty_map = _apply_lulc_penalties(
+                lulc_utm, transform, (rows, cols), slope_pct=slope_pct
+            )
+            lulc_source = "OSM polygons"
+        else:
+            lulc_source = "none (unmapped base only)"
+
+    log.info(f"LULC penalty source: {lulc_source}")
 
     # Phase 3: if OSM water is sparse, derive stream network from DEM
     if osm_stats.get('dem_stream_fallback'):
@@ -403,27 +452,18 @@ def main():
                 max(0, c - 1):min(cols, c + 2),
             ] = 1.0
 
-    # ── 8. Two-resolution routing (Phase 4/5) ──────────────────────────────
-    # Phase 5: estimate peak memory for fine-resolution band and auto-escalate
-    # COARSE_FACTOR if the estimate exceeds MEMORY_WARN_GB.
-    fine_coarse = COARSE_FACTOR
-    fine_cells_est = int(rows * cols * (CORRIDOR_BAND_KM * 2000 / max(rows, cols) / RESOLUTION))
-    fine_mem_gb = fine_cells_est * 8 / 1e9   # float64
-    if fine_mem_gb > MEMORY_WARN_GB:
-        fine_coarse = fine_coarse * 2
-        log.warning(
-            f"Estimated fine-grid memory {fine_mem_gb:.1f} GB > "
-            f"MEMORY_WARN_GB={MEMORY_WARN_GB:.1f}. "
-            f"Auto-escalating COARSE_FACTOR {COARSE_FACTOR}→{fine_coarse} "
-            f"to reduce memory footprint."
-        )
+    # ── 8. Multi-Scale LCP routing (Tang & Dou 2023) ─────────────────────────
+    # Generate the multi-resolution pyramid
+    timer.start("8.1_build_pyramid")
+    log.info(f"Building cost pyramid ({PYRAMID_LEVELS} levels, {DOWNSAMPLE_RATIO}:1 ratio, method={DOWNSAMPLE_METHOD})")
+    cost_pyramid = build_cost_pyramid(cost, PYRAMID_LEVELS, DOWNSAMPLE_RATIO, DOWNSAMPLE_METHOD)
+    timer.stop()
 
-    log.info(f"Running coarse-to-fine routing (COARSE_FACTOR={fine_coarse}) …")
-    timer.start("8_routing")
-    path_indices = coarse_to_fine_routing(
-        cost, start_rc, end_rc, water_mask, transform,
-        resolution_m=RESOLUTION, dem=dem,
-        factor=fine_coarse,           # Phase 5: may be auto-escalated
+    log.info("Running multi-scale segmented routing (MS-LCP) …")
+    timer.start("8.2_ms_lcp")
+    path_indices = multi_scale_lcp(
+        cost_pyramid, start_rc, end_rc, water_mask, transform,
+        resolution_m=RESOLUTION, dem=dem
     )
     timer.stop()
 
@@ -460,6 +500,17 @@ def main():
                 f"Could not fully satisfy {min_radius:.0f} m curve-radius constraint. "
                 "Outputting best-effort geometry."
             )
+
+    # ── 10b. Phase 12: minimum tangent/curve length check ─────────────────
+    design_lengths = verify_design_lengths(smooth_utm)
+    n_dl_violations = (
+        len(design_lengths["tangent_violations"])
+        + len(design_lengths["curve_violations"])
+    )
+    if n_dl_violations > 0:
+        warnings_list.append(
+            f"Design length violations: {n_dl_violations} segments below minimum"
+        )
 
     line_utm = LineString(smooth_utm)
 
