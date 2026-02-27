@@ -84,15 +84,17 @@ def filter_bridge_worthy_water(water_utm):
     Filter water_utm GeoDataFrame to retain only features that could
     realistically require a bridge.
 
+    LineString/MultiLineString waterways are buffered by 5.0m to convert 
+    them into Polygon representations of the river channel.
+
     Exclusions (Myanmar low-quality OSM context):
-      1. Non-polygon geometries (LineString waterways are centrelines, not
-         water surface area; Points are gauge stations).
-      2. natural=wetland (seasonally saturated land, not a waterway).
-      3. Non-crossable waterway tags (dams, weirs, fish ponds, docks, ditches).
-      4. Polygons smaller than BRIDGE_MIN_WATER_AREA_M2.
+      1. natural=wetland (seasonally saturated land, not a waterway).
+      2. Non-crossable waterway tags (dams, weirs, fish ponds, docks, ditches).
+      3. Features smaller than BRIDGE_MIN_WATER_AREA_M2.
 
     Retained features:
-      - natural=water polygons (rivers, lakes, reservoirs) ≥ min area
+      - Polygons/MultiPolygons and LineStrings/MultiLineStrings
+      - natural=water polygons (rivers, lakes, reservoirs)
       - Polygons with waterway in BRIDGE_WORTHY_WATERWAY_TAGS
     """
     if water_utm is None or len(water_utm) == 0:
@@ -109,8 +111,10 @@ def filter_bridge_worthy_water(water_utm):
 
     n_before = len(water_utm)
 
-    # 1. Keep only Polygon / MultiPolygon geometries
-    mask_poly = water_utm.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+    # 1. Keep Polygon/MultiPolygon AND LineString/MultiLineString geometries
+    mask_geom = water_utm.geometry.geom_type.isin([
+        "Polygon", "MultiPolygon", "LineString", "MultiLineString"
+    ])
 
     # 2. Exclude natural=wetland
     mask_natural_ok = True  # default: keep
@@ -125,8 +129,14 @@ def filter_bridge_worthy_water(water_utm):
         mask_waterway_ok = ~ww_vals.isin(BRIDGE_EXCLUDE_WATERWAY_TAGS)
 
     # Combined mask
-    mask = mask_poly & mask_natural_ok & mask_waterway_ok
+    mask = mask_geom & mask_natural_ok & mask_waterway_ok
     filtered = water_utm[mask].copy()
+
+    # Convert lines to polygons by buffering (simulate 10m-wide channel)
+    if len(filtered) > 0:
+        is_line = filtered.geometry.geom_type.isin(["LineString", "MultiLineString"])
+        if is_line.any():
+            filtered.loc[is_line, "geometry"] = filtered.loc[is_line, "geometry"].buffer(5.0)
 
     # 4. Minimum polygon area filter
     if len(filtered) > 0:
@@ -136,51 +146,68 @@ def filter_bridge_worthy_water(water_utm):
     n_after = len(filtered)
     log.info(
         f"Structures: bridge-worthy water filter: {n_before} → {n_after} features "
-        f"(removed {n_before - n_after}: non-polygon, wetland, dam/weir, small ponds)"
+        f"(buffered lines, removed wetlands/dams/small ponds)"
     )
     return filtered.reset_index(drop=True)
 
 
 # ── Step 0b: Crossing angle validation ────────────────────────────────────────
 
-def _crossing_angle_deg(route_ls, seg, water_geom):
+def _validate_crossing(route_ls, seg, water_geom):
     """
-    Compute the angle (degrees) between the route direction at a crossing
-    and the longest axis of the water polygon.
+    Validate if a crossing is a true transverse crossing rather than
+    the route skimming the bank or running longitudinally inside the river.
+    
+    Instead of unreliable bounding box angles, this uses the ratio between
+    the crossing span (seg.length) and the local river width.
+    If span > 3 * local_width, it's a longitudinal run, not a crossing.
 
-    Returns a value in [0, 90]. High = perpendicular (good bridge crossing).
-    Low = parallel (route running alongside, false positive).
+    Returns (is_valid, local_width, span_length)
     """
-    # Route direction at intersection midpoint
-    mid_frac = route_ls.project(seg.interpolate(0.5, normalized=True), normalized=True)
-    eps = 0.001
-    p1 = route_ls.interpolate(max(0.0, mid_frac - eps), normalized=True)
-    p2 = route_ls.interpolate(min(1.0, mid_frac + eps), normalized=True)
-    route_dx = p2.x - p1.x
-    route_dy = p2.y - p1.y
+    span_len = seg.length
+    if span_len < 1.0:
+        return False, 0.0, span_len
 
-    # Water body longest axis (from minimum rotated rectangle)
+    # Find the midpoint of the route segment inside the water
+    mid_pt = seg.interpolate(0.5, normalized=True)
+    
+    # Calculate route direction vector at midpoint
+    eps = min(5.0, span_len / 4.0)
     try:
-        rect = water_geom.minimum_rotated_rectangle
-        coords = list(rect.exterior.coords)
-        # Compute the two edge vectors of the rectangle
-        e1 = (coords[1][0] - coords[0][0], coords[1][1] - coords[0][1])
-        e2 = (coords[2][0] - coords[1][0], coords[2][1] - coords[1][1])
-        # Longest edge is the 'major axis'
-        l1 = math.hypot(*e1)
-        l2 = math.hypot(*e2)
-        water_dx, water_dy = e1 if l1 >= l2 else e2
-    except Exception:
-        return 90.0  # If geometry is degenerate, assume perpendicular (allow)
-
-    # Angle between vectors (absolute, mapped to [0, 90])
-    denom = math.hypot(route_dx, route_dy) * math.hypot(water_dx, water_dy)
-    if denom < 1e-9:
-        return 90.0
-    cos_angle = abs(route_dx * water_dx + route_dy * water_dy) / denom
-    cos_angle = min(1.0, cos_angle)  # clamp for numerical safety
-    angle_deg = math.degrees(math.acos(cos_angle))
-    return angle_deg   # 0 = parallel, 90 = perpendicular
+        mid_s = route_ls.project(mid_pt)
+        p1 = route_ls.interpolate(max(0.0, mid_s - eps))
+        p2 = route_ls.interpolate(min(route_ls.length, mid_s + eps))
+        dr = p2.x - p1.x
+        dc = p2.y - p1.y
+        norm = math.hypot(dr, dc)
+        if norm < 1e-6:
+            # Fallback
+            return True, span_len, span_len
+            
+        dx, dy = dr/norm, dc/norm
+        
+        # Perpendicular vector to measure river width
+        px, py = -dy, dx
+        
+        # Measure local river width by throwing a transect line across the midpoint
+        # 2000m total transect (1000m each side) should cover Ayeyarwady
+        from shapely.geometry import LineString
+        t_start = (mid_pt.x - px * 1000.0, mid_pt.y - py * 1000.0)
+        t_end   = (mid_pt.x + px * 1000.0, mid_pt.y + py * 1000.0)
+        transect = LineString([t_start, t_end])
+        
+        width_inter = transect.intersection(water_geom)
+        local_width = width_inter.length if not width_inter.is_empty else span_len
+        
+        # If the route span is more than 3x the local width, it's running parallel/longitudinally
+        if span_len > max(local_width * 3.0, 50.0):
+            return False, local_width, span_len
+            
+        return True, local_width, span_len
+        
+    except Exception as e:
+        log.debug(f"Structures: crossing validation exception: {e}")
+        return True, span_len, span_len
 
 
 # ── Step 1: Find water crossings using route–water intersection ───────────────
@@ -254,18 +281,18 @@ def _find_water_crossings(smooth_utm, water_utm, va_result):
         try:
             from config import BRIDGE_MIN_CROSSING_ANGLE_DEG
         except ImportError:
-            BRIDGE_MIN_CROSSING_ANGLE_DEG = 15.0
+            BRIDGE_MIN_CROSSING_ANGLE_DEG = 30.0  # Increased to prevent false positives
 
         for seg in segs:
             if seg.length < 1.0:
                 continue
 
-            # Phase 8b: crossing angle validation
-            angle = _crossing_angle_deg(route_ls, seg, geom)
-            if angle < BRIDGE_MIN_CROSSING_ANGLE_DEG:
+            # Phase 8b: crossing validation (replaces angle check)
+            is_valid, local_width, span = _validate_crossing(route_ls, seg, geom)
+            if not is_valid:
                 log.debug(
-                    f"Structures: rejected crossing (angle={angle:.1f}° < "
-                    f"{BRIDGE_MIN_CROSSING_ANGLE_DEG}° — route parallel to water body)"
+                    f"Structures: rejected crossing (span {span:.1f}m > 3x width {local_width:.1f}m "
+                    f"— route parallel to water body)"
                 )
                 continue
 
@@ -276,7 +303,7 @@ def _find_water_crossings(smooth_utm, water_utm, va_result):
             if s_end < s_start:
                 s_start, s_end = s_end, s_start
             span = s_end - s_start
-            if span < 2.0:
+            if span < 5.0:  # Ignore tiny clips on the edge
                 continue
             crossings.append({
                 "start_m":    s_start,
@@ -461,7 +488,6 @@ def build_structure_inventory(
     bridge_freeboard_m: float     = 1.5,
     bridge_cost_per_m2_usd: float = 3_500.0,
     bridge_width_m: float         = 12.0,
-    culvert_unit_cost_usd: float  = 15_000.0,
     min_culvert_accum_cells: int  = 200,
 ) -> StructureInventory:
     """
@@ -489,8 +515,6 @@ def build_structure_inventory(
     bridge_width_m : float
         Assumed bridge deck width (m) = carriageway + parapets.
         For rural_trunk 2-lane: 11 m + 1 m parapets = 12 m.
-    culvert_unit_cost_usd : float
-        Lump sum per box culvert or pipe culvert (USD). Default 15,000.
     min_culvert_accum_cells : int
         Minimum upstream cells for culvert siting. Cells × RESOLUTION² ≈ drainage
         area. Default 200 → at 30 m resolution ≈ 0.18 km² catchment.
@@ -499,25 +523,70 @@ def build_structure_inventory(
     -------
     StructureInventory
     """
+    # Fetch config parameters inside the function to avoid circular imports during testing
+    try:
+        from config import (
+            BRIDGE_BANK_SETBACK_M, 
+            CULVERT_PIPE_COST_USD, CULVERT_BOX_COST_USD, CULVERT_MAJOR_COST_USD,
+            CULVERT_TIER_1_CELLS, CULVERT_TIER_2_CELLS
+        )
+    except ImportError:
+        BRIDGE_BANK_SETBACK_M = 15.0
+        CULVERT_PIPE_COST_USD = 10_000.0
+        CULVERT_BOX_COST_USD = 25_000.0
+        CULVERT_MAJOR_COST_USD = 75_000.0
+        CULVERT_TIER_1_CELLS = 500
+        CULVERT_TIER_2_CELLS = 2000
+
     # Step 1 — bridges
     crossings = _find_water_crossings(smooth_utm, water_utm, va_result)
 
     structures: list[Structure] = []
     bridge_mid_chainages = set()
 
+    # Extract minimum bridge length from WATER_PENALTY_TIERS via config if possible, else default 10m
+    try:
+        from config import BRIDGE_MIN_SPAN_M
+    except ImportError:
+        BRIDGE_MIN_SPAN_M = 10.0
+
     for i, cr in enumerate(crossings):
         mid_s     = cr["mid_m"]
-        deck_elev = _z_at(mid_s, va_result) + bridge_freeboard_m
-        cost      = bridge_cost_per_m2_usd * cr["length_m"] * bridge_width_m
+        # Freeboard is enforced in Phase 6 z_design. Deck elevation IS z_design.
+        deck_elev = _z_at(mid_s, va_result) 
         lon, lat  = _utm_chainage_to_wgs84(mid_s, smooth_utm, va_result)
+        
+        # Re-classify minor crossings as culverts based on RAW span
+        if cr["length_m"] < BRIDGE_MIN_SPAN_M:
+            structures.append(Structure(
+                structure_id      = i + 1,
+                structure_type    = "culvert", # Major Box Culvert
+                chainage_m        = mid_s,
+                chainage_start_m  = mid_s, # Culverts don't have span representations in output
+                chainage_end_m    = mid_s,
+                length_m          = cr["length_m"], # Setbacks don't apply to culverts
+                deck_elevation_m  = deck_elev,
+                freeboard_m       = 0.0,
+                estimated_cost_usd= CULVERT_MAJOR_COST_USD,
+                water_name        = cr["water_name"],
+                lon               = lon,
+                lat               = lat,
+            ))
+            bridge_mid_chainages.add(mid_s) # Still prevent another culvert here
+            continue
 
+        # If it's a bridge, calculate total length including bank setbacks
+        total_bridge_len_m = cr["length_m"] + (2 * BRIDGE_BANK_SETBACK_M)
+
+        cost      = bridge_cost_per_m2_usd * total_bridge_len_m * bridge_width_m
+        
         structures.append(Structure(
             structure_id      = i + 1,
             structure_type    = "bridge",
             chainage_m        = mid_s,
             chainage_start_m  = cr["start_m"],
             chainage_end_m    = cr["end_m"],
-            length_m          = cr["length_m"],
+            length_m          = total_bridge_len_m,
             deck_elevation_m  = deck_elev,
             freeboard_m       = bridge_freeboard_m,
             estimated_cost_usd= cost,
@@ -527,7 +596,7 @@ def build_structure_inventory(
         ))
         bridge_mid_chainages.add(mid_s)
 
-    bridge_cnt = len(structures)
+    bridge_cnt = len(structures) - sum(1 for s in structures if s.structure_type == "culvert")
 
     # Step 2 — culverts
     culvert_sites = _find_culvert_sites(
@@ -539,6 +608,16 @@ def build_structure_inventory(
     for j, site in enumerate(culvert_sites):
         s        = site["chainage_m"]
         lon, lat = _utm_chainage_to_wgs84(s, smooth_utm, va_result)
+        
+        # Stratify culvert costs based on catchment size
+        accum = site["flow_accum_cells"]
+        if accum < CULVERT_TIER_1_CELLS:
+            culvert_cost = CULVERT_PIPE_COST_USD
+        elif accum < CULVERT_TIER_2_CELLS:
+            culvert_cost = CULVERT_BOX_COST_USD
+        else:
+            culvert_cost = CULVERT_MAJOR_COST_USD
+            
         structures.append(Structure(
             structure_id      = bridge_cnt + j + 1,
             structure_type    = "culvert",
@@ -548,7 +627,7 @@ def build_structure_inventory(
             length_m          = 0.0,
             deck_elevation_m  = _z_at(s, va_result),
             freeboard_m       = 0.0,
-            estimated_cost_usd= culvert_unit_cost_usd,
+            estimated_cost_usd= culvert_cost,
             water_name        = "drainage",
             lon               = lon,
             lat               = lat,

@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 
 from structures import (
     _z_at, _find_culvert_sites, build_structure_inventory,
-    _find_water_crossings, _filter_bridge_worthy_water,
+    _find_water_crossings, filter_bridge_worthy_water,
 )
 
 
@@ -204,7 +204,6 @@ def test_structure_sorting():
         bridge_freeboard_m=1.5,
         bridge_cost_per_m2_usd=3500.0,
         bridge_width_m=12.0,
-        culvert_unit_cost_usd=15000.0,
         min_culvert_accum_cells=100,
     )
 
@@ -305,10 +304,10 @@ def test_linestring_not_bridged():
     )
 
     crossings = _find_water_crossings(route, water_gdf, va)
-    assert len(crossings) == 0, (
-        f"LineString stream should NOT produce a bridge, got {len(crossings)} crossings"
+    assert len(crossings) == 1, (
+        f"LineString stream should produce a buffered 1 crossing for culvert, got {len(crossings)} crossings"
     )
-    print("  ✓ test_linestring_not_bridged")
+    print("  ✓ test_linestring_not_bridged (now properly buffered to 1 crossing)")
 
 
 # ── Test 10: Real river polygon IS detected as bridge ─────────────────────────

@@ -532,7 +532,7 @@ def _plot_folium_map(route_wgs84, slope_along_route, meta, thresholds,
 
     # Draw route as segments
     route_fg = folium.FeatureGroup(name="Route", show=True)
-    step = max(1, len(route_wgs84) // 500)  # limit to ~500 segments for performance
+    step = max(1, len(route_wgs84) // 3000)  # limit to ~3000 segments for performance
     for i in range(0, len(route_wgs84) - step, step):
         j = min(i + step, len(route_wgs84) - 1)
         p1 = route_wgs84[i]

@@ -228,10 +228,14 @@ LULC_EDGE_DECAY_M = 150  # Distance over which penalty decays to 1.0 outside pol
 # Tier 2: medium river 50–200 m → medium bridge
 # Tier 3: large river 200–500 m → major bridge (Chindwin-scale)
 # Tier 4: navigation river >500 m → Ayeyarwady-scale; find narrowest crossing
-WATER_PENALTY_TIERS = [2, 5, 10, 20, 30]
+WATER_PENALTY_TIERS = [1.5, 3.0, 5.0, 10.0, 15.0]
 
 # Bridge constraints
 MIN_BRIDGE_SPACING_M = 10_000   # Minimum distance between two major bridge sites
+BRIDGE_BANK_SETBACK_M = 15.0    # Setback from riverbank edge to the abutment
+
+# ── Floodplain Constraints ───────────────────────────────────────────────────
+FLOODPLAIN_MIN_FILL_M = 2.5     # Assumed min height of embankment across a floodplain
 
 # ── Legacy flat penalty (retained as fallback if hierarchy fails) ───────────────
 WATER_PENALTY = 5_000
@@ -396,14 +400,17 @@ BRIDGE_COST_PER_M2_USD: float = 3_500.0
 # rural_trunk (2-lane): 11.0 m carriageway + 0.5 m per side = 12.0 m
 BRIDGE_DECK_WIDTH_M: float = 12.0
 
-# CULVERT_UNIT_COST_USD: lump-sum cost per culvert structure (box or pipe).
-# Myanmar DRD standard box culvert (1.2 m × 1.2 m × 12 m): ~USD 12,000–18,000.
-CULVERT_UNIT_COST_USD: float = 15_000.0
+# CULVERT TIER COSTS: Stratified cost based on flow accumulation (catchment size).
+CULVERT_PIPE_COST_USD: float = 10_000.0
+CULVERT_BOX_COST_USD: float = 25_000.0
+CULVERT_MAJOR_COST_USD: float = 75_000.0
 
 # MIN_CULVERT_ACCUM_CELLS: minimum D8 flow-accumulation cell count to trigger
 # a culvert. At RESOLUTION=30 m, each cell ~ 900 m² catchment.
 # 200 cells → ~0.18 km² catchment → warrants a culvert.
 MIN_CULVERT_ACCUM_CELLS: int = 200
+CULVERT_TIER_1_CELLS: int = 500
+CULVERT_TIER_2_CELLS: int = 2000
 
 # ── Phase 8b: Bridge Detection Filtering (Myanmar low-quality OSM context) ────
 #

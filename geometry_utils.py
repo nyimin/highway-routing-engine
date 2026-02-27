@@ -195,7 +195,7 @@ def _segment_slope_means(coords_utm, slope_pct, transform, window=20):
     return np.array(local_slopes)
 
 
-def smooth_path(coords_utm, n_points=500, smoothing=None,
+def smooth_path(coords_utm, n_points=None, smoothing=None,
                 slope_pct=None, transform=None):
     """
     Segment-aware B-spline smoothing.
@@ -214,6 +214,11 @@ def smooth_path(coords_utm, n_points=500, smoothing=None,
 
     xs = np.array([c[0] for c in coords_utm])
     ys = np.array([c[1] for c in coords_utm])
+
+    # Dynamically determine point density (1 point per 10m)
+    if n_points is None or n_points <= 1000:
+        dist = sum(math.hypot(xs[i] - xs[i-1], ys[i] - ys[i-1]) for i in range(1, len(xs)))
+        n_points = max(500, int(dist / 10.0))
 
     base_s = len(coords_utm) * 4.0 if smoothing is None else smoothing
 
@@ -473,8 +478,24 @@ def verify_row_setback(line_utm, buildings_utm, buffer_m=ROW_BUFFER_M):
         log.info("No building data — RoW setback check skipped.")
         return True
 
-    all_buildings = unary_union(buildings_utm.geometry.tolist())
-    min_dist = line_utm.distance(all_buildings)
+    # Avoid unary_union on 500k+ buildings (causes silent GEOS crash/OOM)
+    # Avoid single nearest() query with a 200km line which causes O(N) worst-case bounding box checks.
+    # Instead, segment the line, find nearest building per segment, then find exact min distance among those candidates.
+    import geopandas as gpd
+    import numpy as np
+    from shapely.geometry import LineString
+
+    coords = list(line_utm.coords)
+    segments_gs = gpd.GeoSeries([LineString([coords[i], coords[i+1]]) for i in range(len(coords)-1)])
+    
+    nearest_idx = buildings_utm.sindex.nearest(segments_gs)
+    if nearest_idx is None or len(nearest_idx) == 0 or len(nearest_idx[1]) == 0:
+        log.info("No buildings found near the alignment.")
+        return True
+    
+    candidate_bldg_idx = np.unique(nearest_idx[1])
+    candidate_bldgs = buildings_utm.iloc[candidate_bldg_idx].geometry
+    min_dist = candidate_bldgs.distance(line_utm).min()
 
     if min_dist < buffer_m:
         log.warning(

@@ -36,7 +36,7 @@ log = logging.getLogger("highway_alignment")
 
 # ── Phase 12: Earthwork Proxy Cost ───────────────────────────────────────────
 
-def compute_earthwork_proxy(dem, slope_pct, resolution_m, weight=0.30):
+def compute_earthwork_proxy(dem, slope_pct, resolution_m, weight=0.30, floodplain_mask=None):
     """
     Estimate earthwork difficulty from local terrain relief (inspired by 3D-CHA*).
 
@@ -50,10 +50,11 @@ def compute_earthwork_proxy(dem, slope_pct, resolution_m, weight=0.30):
       3. Normalize to a cost multiplier [1.0 … ~3.0].
 
     Args:
-        dem:          float32 DEM array (UTM, metres)
-        slope_pct:    float32 slope-percent array
-        resolution_m: pixel size in metres
-        weight:       blending weight (0 = disabled, 0.3 = default, 1.0 = dominant)
+        dem:             float32 DEM array (UTM, metres)
+        slope_pct:       float32 slope-percent array
+        resolution_m:    pixel size in metres
+        weight:          blending weight (0 = disabled, 0.3 = default, 1.0 = dominant)
+        floodplain_mask: optional boolean mask denoting floodplain cells
 
     Returns:
         float32 multiplier array (values ≥ 1.0), same shape as dem.
@@ -71,12 +72,21 @@ def compute_earthwork_proxy(dem, slope_pct, resolution_m, weight=0.30):
     fw = FORMATION_WIDTH_M[SCENARIO_PROFILE]
     max_g = GRADE_MAX_PCT[SCENARIO_PROFILE] / 100.0  # fraction
 
+    try:
+        from config import FLOODPLAIN_MIN_FILL_M
+    except ImportError:
+        FLOODPLAIN_MIN_FILL_M = 2.5
+
     # ── Step 1: local elevation relief ────────────────────────────────────
     # Difference between cell and local mean = how much earthwork is needed
     # to level the road through this terrain.
     from scipy.ndimage import uniform_filter
     dem_smooth = uniform_filter(dem.astype(np.float64), size=5, mode='reflect')
     relief = np.abs(dem - dem_smooth).astype(np.float32)  # metres
+    
+    if floodplain_mask is not None:
+        # Increase relief in floodplains to simulate mandatory high embankments
+        relief = np.where(floodplain_mask, relief + FLOODPLAIN_MIN_FILL_M, relief)
 
     # ── Step 2: approximate cross-section volume per metre of road ────────
     # For a relief of h metres:
@@ -767,13 +777,19 @@ def build_cost_surface(slope_pct, building_penalty_map, water_mask, roads_mask=N
     # ── 1. Slope cost ─────────────────────────────────────────────────────
     cost = _slope_cost_array(slope_pct)
 
+    # ── 1a. Precompute Floodplain Mask ────────────────────────────────────
+    floodplain = None
+    if dem is not None:
+        # compute_floodplain_mask must be defined earlier in the file or imported
+        floodplain = compute_floodplain_mask(dem, water_mask, resolution_m)
+
     # ── 1b. Phase 12: Earthwork proxy (3D-CHA* inspired) ─────────────────
     # Multiplicative layer that penalises cells requiring large cut/fill.
     if dem is not None:
         from config import EARTHWORK_PROXY_WEIGHT
         if EARTHWORK_PROXY_WEIGHT > 0:
             earthwork_mult = compute_earthwork_proxy(
-                dem, slope_pct, resolution_m, weight=EARTHWORK_PROXY_WEIGHT
+                dem, slope_pct, resolution_m, weight=EARTHWORK_PROXY_WEIGHT, floodplain_mask=floodplain
             )
             cost *= earthwork_mult
 
@@ -830,8 +846,7 @@ def build_cost_surface(slope_pct, building_penalty_map, water_mask, roads_mask=N
         log.info(f"Bridge abutment zones: {np.sum(mask_steep_abutment):,} steep bank cells recovered.")
 
     # ── 5. Floodplain amplification ───────────────────────────────────────
-    if dem is not None:
-        floodplain = compute_floodplain_mask(dem, water_mask, resolution_m)
+    if floodplain is not None:
         # 3× amplification — passable but costly (drainage structures, embankment)
         cost = np.where(floodplain & (cost < IMPASSABLE), cost * 3.0, cost)
 

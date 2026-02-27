@@ -403,22 +403,23 @@ def multi_pass_routing(cost, start_rc, end_rc, water_mask, transform,
         if not clean_bridges or br != clean_bridges[-1]:
             clean_bridges.append(br)
 
-    # Build sequence of waypoints: Start -> Bridge 1 -> Bridge 2 -> ... -> End
-    waypoints = [start_rc] + clean_bridges + [end_rc]
-    full_path = []
-
-    for i in range(len(waypoints) - 1):
-        wp_from = waypoints[i]
-        wp_to = waypoints[i + 1]
-        log.info(f"Micro alignment {i + 1}/{len(waypoints) - 1}: {wp_from} → {wp_to} …")
-        mc_seg = apply_rubber_band_penalty(
-            cost, wp_from, wp_to, weight=RUBBER_BAND_MICRO_W, reference_mask=reference_mask
-        )
-        seg_path = find_path(mc_seg, wp_from, wp_to)
-        if i > 0:
-            full_path += seg_path[1:]
-        else:
-            full_path += seg_path
+    log.info(f"Found {len(clean_bridges)} bridge sites. Applying soft corridors...")
+    
+    # Create soft corridors at bridge sites instead of forcing hard waypoints
+    corridor_cost = apply_rubber_band_penalty(
+        cost, start_rc, end_rc, weight=RUBBER_BAND_MICRO_W, reference_mask=reference_mask
+    )
+    
+    # For each bridge site, paint a deeply discounted swath across the river
+    from skimage.draw import disk
+    for r, c in clean_bridges:
+        # Paint a 5-pixel (150m) discounted radius around the optimal crossing
+        rr, cc = disk((r, c), radius=5, shape=corridor_cost.shape)
+        # Attract the path to this crossing zone without forcing a literal 1-pixel kink
+        corridor_cost[rr, cc] = corridor_cost[rr, cc] * 0.01
+        
+    log.info("Running single continuous micro-alignment through soft corridors...")
+    full_path = find_path(corridor_cost, start_rc, end_rc)
 
     log.info(f"Combined path: {len(full_path)} waypoints")
     return full_path
