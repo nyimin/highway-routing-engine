@@ -31,6 +31,7 @@ from config import (
     DATA_DIR, UTM_EPSG, OPENTOPO_URL, RESOLUTION,
     DEM_PREFERENCE, DEM_NODATA_SENTINEL,
     OSM_WATER_FALLBACK_TRIGGER, STREAM_ACCUM_THRESHOLD_KM2,
+    OSM_LULC_WARN_THRESHOLD,
 )
 from geometry_utils import wgs84_to_utm
 
@@ -367,23 +368,30 @@ def derive_stream_network(dem, transform, resolution_m,
 
 def fetch_osm_layers(bbox_wgs84):
     """
-    Fetch buildings and water from OSM via Overpass.
-    Returns (buildings_gdf, water_gdf, osm_stats_dict).
+    Fetch buildings, water, existing roads (highway), and land cover (landuse/natural) 
+    from OSM via Overpass.
+    Returns (buildings_gdf, water_gdf, roads_gdf, lulc_gdf, osm_stats_dict).
     Empty GeoDataFrames are returned on failure — check osm_stats for coverage.
     """
     _ensure_data_dir()
     key = _bbox_key(bbox_wgs84)
     cache_buildings = os.path.join(DATA_DIR, f"buildings_{key}.gpkg")
     cache_water     = os.path.join(DATA_DIR, f"water_{key}.gpkg")
+    cache_roads     = os.path.join(DATA_DIR, f"roads_{key}.gpkg")
+    cache_lulc      = os.path.join(DATA_DIR, f"lulc_{key}.gpkg")
 
     west  = float(bbox_wgs84[0])
     south = float(bbox_wgs84[1])
     east  = float(bbox_wgs84[2])
     north = float(bbox_wgs84[3])
 
-    stats = {"buildings": 0, "water": 0, "buildings_from_cache": False, "water_from_cache": False}
+    stats = {
+        "buildings": 0, "water": 0, "roads": 0, "lulc": 0,
+        "buildings_from_cache": False, "water_from_cache": False,
+        "roads_from_cache": False, "lulc_from_cache": False
+    }
 
-    def _load_or_fetch(cache_path, tags, label, stat_key, from_cache_key):
+    def _load_or_fetch(cache_path, tags, label, stat_key, from_cache_key, **kwargs):
         if os.path.exists(cache_path):
             try:
                 gdf = gpd.read_file(cache_path)
@@ -400,7 +408,13 @@ def fetch_osm_layers(bbox_wgs84):
                 bbox=(west, south, east, north),
                 tags=tags,
             )
-            gdf = gdf[["geometry"]].copy().reset_index(drop=True)
+            # Retain specific tags if requested, otherwise just geometry
+            if "retain_tags" in kwargs:
+                cols_to_keep = ["geometry"] + [t for t in kwargs["retain_tags"] if t in gdf.columns]
+                gdf = gdf[cols_to_keep].copy().reset_index(drop=True)
+            else:
+                gdf = gdf[["geometry"]].copy().reset_index(drop=True)
+            
             gdf.to_file(cache_path, driver="GPKG")
             stats[stat_key] = len(gdf)
             log.info(f"OSM {label}: {len(gdf)} features fetched and cached.")
@@ -419,6 +433,65 @@ def fetch_osm_layers(bbox_wgs84):
         {"natural": ["water", "wetland"], "waterway": True},
         "water / waterways", "water", "water_from_cache",
     )
+    roads = _load_or_fetch(
+        cache_roads,
+        # Phase 5.4: Full highway class list including trunk/primary, which are
+        # the strongest attractors for alignment reuse.  'path' is intentionally
+        # excluded — it maps footpaths/hiking trails that have no road formation
+        # or ROW relevance, and add noise in Myanmar's rural areas.
+        #
+        # Myanmar OSM note: major corridors (trunk/primary) are reasonably mapped;
+        # secondary/track coverage is variable.  Presence = reliable; absence
+        # does not imply road-free terrain.
+        {
+            "highway": [
+                "motorway", "trunk", "primary",        # grade-separated / paved national
+                "secondary", "tertiary",               # regional / collector
+                "unclassified", "track",               # minor / earthwork (no 'path')
+            ]
+        },
+        "roads / tracks", "roads", "roads_from_cache",
+        retain_tags=["highway"]
+    )
+    lulc = _load_or_fetch(
+        cache_lulc,
+        # Phase 5.4: Expanded LULC tag set for Myanmar context.
+        # Added: orchard, vineyard, rubber, meadow (agriculture compensation);
+        #        mud, reef (coastal/tidal subgrade);
+        #        boundary=protected_area, leisure=nature_reserve (legal barriers).
+        #
+        # Myanmar OSM note: LULC coverage is severely incomplete — many real
+        # forest and wetland areas have NO OSM polygon.  The pipeline applies
+        # LULC_UNMAPPED_BASE as a background multiplier to partially compensate.
+        # OSM_LULC_WARN_THRESHOLD triggers a WARNING if coverage looks thin.
+        {
+            "landuse": [
+                "forest", "farmland", "conservation", "wood",
+                "orchard", "vineyard", "rubber", "meadow",
+                "national_park",
+            ],
+            "natural":  ["wetland", "wood", "scrub", "bare_rock", "mud", "reef",
+                         "mangrove"],
+            "leisure":  ["nature_reserve"],
+            "boundary": ["protected_area", "national_park"],
+        },
+        "land use cover", "lulc", "lulc_from_cache",
+        retain_tags=["landuse", "natural", "leisure", "boundary"]
+    )
+
+    # Phase 5.4: LULC data-coverage warning.
+    # If very few polygons returned, the LULC layer is likely severely
+    # under-representing ground truth — flag this prominently so reviewers
+    # do not mistake a quiet cost surface for a fully-mapped one.
+    if stats["lulc"] < OSM_LULC_WARN_THRESHOLD:
+        log.warning(
+            f"OSM LULC coverage: only {stats['lulc']} polygon(s) returned for "
+            f"this bounding box (threshold: {OSM_LULC_WARN_THRESHOLD}).  "
+            f"LULC penalties will be SIGNIFICANTLY underrepresented — "
+            f"many real forests, wetlands, and protected areas are likely "
+            f"unmapped in OSM for this part of Myanmar.  "
+            f"LULC_UNMAPPED_BASE background multiplier partially compensates."
+        )
 
     # ── Phase 3: DEM stream fallback ─────────────────────────────────────
     # If OSM water coverage is too sparse, a dem_stream_fallback key is set in
@@ -432,7 +505,7 @@ def fetch_osm_layers(bbox_wgs84):
         )
         stats["dem_stream_fallback"] = True
 
-    return buildings, water, stats
+    return buildings, water, roads, lulc, stats
 
 
 def derive_stream_mask_utm(dem_utm, transform_utm, resolution_m=30):

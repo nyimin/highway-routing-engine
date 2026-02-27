@@ -19,3 +19,9 @@ requests>=2.31
 # JIT acceleration for cost surface — 10-50x speedup (Phase 5)
 # pip install numba>=0.57
 
+# ── Phase 5.3: Visualization Suite ────────────────────────
+
+# Interactive HTML map generation
+folium>=0.15
+matplotlib>=3.8
+python-dotenv>=1.0

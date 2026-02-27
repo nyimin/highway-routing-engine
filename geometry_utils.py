@@ -430,3 +430,38 @@ def export_geojson(line_wgs84, metadata, output_path):
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(fc, f, indent=2)
     log.info(f"Exported: {output_path}")
+
+
+def export_geojson_3d(coords_wgs84_3d, metadata, output_path):
+    """
+    Export a 3D LineString GeoJSON with coordinates as [lon, lat, z_design].
+
+    Parameters
+    ----------
+    coords_wgs84_3d : list of (lon, lat, z) tuples
+        WGS-84 longitude, latitude, and design elevation (m) at each station.
+    metadata : dict
+        Feature properties — same as for export_geojson().
+    output_path : str
+        Destination file path (e.g. 'preliminary_route_3d.geojson').
+
+    Notes
+    -----
+    GeoJSON RFC 7946 explicitly supports Z coordinates in coordinate arrays.
+    Most GIS tools (QGIS, kepler.gl, Mapbox) render the Z component for 3D
+    visualisation.  The CRS is always WGS-84 geographic (EPSG:4326).
+    """
+    coords = [[float(lon), float(lat), float(z)] for lon, lat, z in coords_wgs84_3d]
+    feature = {
+        "type": "Feature",
+        "geometry": {
+            "type": "LineString",
+            "coordinates": coords,
+        },
+        "properties": metadata,
+    }
+    fc = {"type": "FeatureCollection", "features": [feature]}
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(fc, f, indent=2)
+    log.info(f"Exported 3D GeoJSON: {output_path}  ({len(coords)} vertices)")
+

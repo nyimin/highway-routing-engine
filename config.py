@@ -79,9 +79,133 @@ SUPERELEVATION_MAX     = _p["superelevation_max"]
 RUBBER_BAND_MACRO_W    = _p["rubber_band_macro_weight"]
 RUBBER_BAND_MICRO_W    = _p["rubber_band_micro_weight"]
 
-# ── Right-of-Way ───────────────────────────────────────────────────────────────
-ROW_BUFFER_M = 30          # Setback from centreline to structures (reduced for soft constraint)
-BUILDING_PENALTY = 5000    # Added cost for routing through a building buffer (triggers resettlement)
+# ── Right-of-Way & Expropriation ──────────────────────────────────────────────
+# Phase 5.2: Industrial Standard Building Buffering
+# Instead of a flat penalty, expropriation cost scales with building footprint area.
+BUILDING_BASE_PENALTY = 2000      # Base penalty for any structure
+BUILDING_AREA_MULT = 20           # Additional penalty per square metre of footprint
+BUILDING_MAX_PENALTY = 50000      # Cap to prevent numeric overflow on massive complexes
+ROW_BUFFER_M = 30                 # Maximum extent of the concentric penalty buffer
+
+
+# ── Phase 5.4: Class-Based Road Discount ──────────────────────────────────────
+#
+# Myanmar OSM data-quality note (2026-02):
+#   Trunk/primary roads on major corridors (Yangon–Naypyidaw, Mandalay–Tamu)
+#   are reasonably mapped. Secondary, tertiary, and track coverage is patchy
+#   to absent outside urban centres.  Positional accuracy of OSM centrelines
+#   can drift 20–50 m, especially for tracks derived from GPS field surveys.
+#
+#   Design principle: presence in OSM is reliable (contributors are careful);
+#   *absence* means nothing — do not infer a road-free gap from an empty OSM
+#   query.  Discounts on cells WHERE a road IS mapped are still valid.
+#
+# Cost multiplier per OSM highway= tag value (< 1.0 = cheaper than greenfield).
+# Lower multiplier → stronger attractor for the router.
+ROAD_CLASS_DISCOUNTS = {
+    "motorway":     0.15,  # Grade-separated expressway; existing full-width formation
+    "trunk":        0.20,  # Major paved national road — minimal upgrade cost
+    "primary":      0.25,  # Paved, maintained — strong reuse attractor
+    "secondary":    0.40,  # Partial pavement / gravel — moderate reconstruction
+    "tertiary":     0.50,  # Gravel / earthwork — significant upgrade needed
+    "unclassified": 0.60,  # Unpaved earthwork formation — full upgrade required
+    "track":        0.65,  # Logging / farm track — usefulness as alignment is limited
+    # "path" intentionally omitted: OSM 'path' = footpath/hiking trail only;
+    # no road formation, no ROW relevance, mostly noise in Myanmar rural areas.
+    "default":      0.70,  # Unknown highway= value — conservative assumption
+}
+
+# Buffer zone around existing road corridors.
+# Even when the router leaves the road centreline, land within this strip has
+# already been disturbed / is accessible for construction equipment.
+# Kept intentionally conservative (0.88×, not 0.80×) because OSM centreline
+# positions in Myanmar can drift 20–50 m — aggressively discounting adjacent
+# cells risks rewarding GPS error rather than real corridor value.
+ROW_CORRIDOR_BUFFER_M        = 50    # Half-width of the ROW acquisition strip (m)
+ROW_CORRIDOR_BUFFER_DISCOUNT = 0.88  # 12 % cost reduction for cells inside this strip
+
+# ── Phase 5.4: Expanded LULC Penalty Table ────────────────────────────────────
+#
+# Myanmar OSM data-quality note:
+#   LULC polygon coverage in Myanmar is severely incomplete.  OSM records
+#   the features that volunteers have mapped; vast areas of real forest,
+#   wetland, and protected land simply have NO OSM polygon and therefore
+#   receive NO penalty from this table.
+#
+#   Consequence: the cost surface will systematically *under-penalise* remote
+#   or unmapped terrain.  Two mitigations are applied:
+#     1. LULC_UNMAPPED_BASE — a global background multiplier (>1.0) applied
+#        to ALL cells that fall outside any LULC polygon.  Reflects that
+#        unmapped terrain in Myanmar is far more likely to be secondary forest
+#        or scrubland than clear open farmland.
+#     2. OSM_LULC_WARN_THRESHOLD — if the Overpass query returns fewer than
+#        this many polygons, the pipeline emits a prominent WARNING in the log
+#        and in the output metadata, so downstream users know the LULC layer
+#        is likely underrepresented.
+#
+#   The penalty VALUES themselves (when a polygon IS present) remain high;
+#   lowering them would make the model less conservative on the features that
+#   ARE captured — which is the wrong direction.
+
+LULC_PENALTIES = {
+    # ── Legal / ESG barriers ──────────────────────────────────────────────────
+    # These carry permitting and EIA costs that can dwarf construction costs.
+    "national_park":  8.0,  # Full EIA + legal consent + carbon offsets required
+    "protected_area": 8.0,  # boundary=protected_area — equivalent legal barrier
+    "nature_reserve": 7.0,  # leisure=nature_reserve — often enforced in Myanmar
+    "conservation":   6.5,  # landuse=conservation (legacy OSM tag, retained)
+
+    # ── High construction / piling cost ───────────────────────────────────────
+    "mangrove":  6.0,  # Extreme piling depth, tidal access, international ESG scrutiny
+    "wetland":   5.0,  # Seasonal saturation — drainage + subgrade stabilisation
+    "swamp":     5.0,  # Similar hydrology to wetland
+    "mud":       4.5,  # Tidal/alluvial mud — deep soft subgrade, high surcharge cost
+    "water":     5.0,  # Overlaps river tier system; used as LULC baseline floor
+    "reef":      6.0,  # Coastal construction — rare but extreme cost
+
+    # ── Forest clearing ───────────────────────────────────────────────────────
+    "forest":  4.0,  # Primary / tropical forest — clearing + carbon credit offset
+    "wood":    2.5,  # Secondary forest / scrub woodland — significant clearing cost
+    "scrub":   1.5,  # Shrubland / regrowth — moderate vegetation removal
+
+    # ── Agricultural compensation ─────────────────────────────────────────────
+    # Myanmar land compensation rates are regulated but enforcement varies.
+    "orchard":   2.2,  # Mature tree crops (durian, mango) — high compensation value
+    "vineyard":  2.0,  # Treated equivalent to orchard
+    "rubber":    2.0,  # Rubber plantation — established industry, organised landowners
+    "farmland":  1.8,  # Mixed / arable farmland — basic acquisition cost
+    "meadow":    1.4,  # Low-value grassland / fallow
+    "grass":     1.2,  # Open grass — minimal vegetation, lower acquisition
+    "bare_rock": 1.3,  # Hard rock outcrop — blasting + disposal cost
+}
+
+# Background multiplier applied to cells with NO LULC polygon (unmapped terrain).
+# In Myanmar, unmapped cells are far more likely to be secondary forest or scrub
+# than cleared open land.  1.15 ≈ intermediate between bare farmland (1.0) and
+# scrubland (1.5); conservative enough to nudge routing toward mapped corridors
+# without creating artificial barriers.
+LULC_UNMAPPED_BASE = 1.15
+
+# Pipeline emits a WARNING if the OSM LULC query returns fewer than this many
+# polygons, flagging likely data incompleteness for downstream reviewers.
+OSM_LULC_WARN_THRESHOLD = 10
+
+# ── Slope × LULC interaction ──────────────────────────────────────────────────
+# Steep terrain amplifies LULC construction cost because:
+#   • Haul-road access to the clearing face is itself expensive;
+#   • Drainage structures multiply with slope;
+#   • Slope stability risk rises with vegetation removal.
+# Formula: lulc_mult_effective = lulc_mult * (1 + SLOPE_LULC_INTERACT * t)
+# where t = clamp(slope_pct / SLOPE_MODERATE_PCT, 0, 1).
+# At t=1 (moderate slope threshold reached), penalty is 50 % amplified.
+SLOPE_LULC_INTERACT = 0.5
+
+# ── LULC boundary soft transition (EDT decay) ─────────────────────────────────
+# Hard-edged LULC polygons create 1-cell cost discontinuities that can cause
+# the router to hug polygon boundaries (cheapest cell just outside the penalty
+# zone).  An EDT-based ramp over LULC_EDGE_DECAY_M blends the penalty to 1.0
+# smoothly, eliminating boundary-hugging artefacts.
+LULC_EDGE_DECAY_M = 150  # Distance over which penalty decays to 1.0 outside polygon
 
 # ── Water Crossing Penalties (per river tier) ──────────────────────────────────
 # Tier 0: micro-stream < 10 m  → culvert / ford
@@ -140,8 +264,180 @@ TILE_ROUTING_THRESHOLD_KM = 300.0
 # PERF_TIMING_ENABLED: track and report wall-clock time per pipeline stage.
 PERF_TIMING_ENABLED = True
 
+# ── Phase 5.3: Routing Polish ────────────────────────────────────────────────
+# TURNING_ANGLE_FILTER_DEG: post-routing filter removes waypoints causing turns
+# sharper than this (measured as interior angle). 160° = near-reversal stutter.
+TURNING_ANGLE_FILTER_DEG = 160.0
+
+# ── Phase 5.3: Diagnostics & Visualization ───────────────────────────────────
+# EXPORT_INTERMEDIATES: save cost surface, building penalty, and per-layer arrays
+# as GeoTIFFs in output/ for external GIS inspection (adds ~50–100 MB per run).
+EXPORT_INTERMEDIATES = True
+
+# GENERATE_VISUALIZATIONS: auto-run the visualization suite after routing completes.
+GENERATE_VISUALIZATIONS = True
+
+# ── Phase 6: Vertical Alignment ───────────────────────────────────────────────
+#
+# K-value table: minimum parabolic curve parameter (m/%) by design speed.
+# K_min = L_min / |A|  where A = algebraic grade change in %.
+# Source: AASHTO Green Book 7th ed. Table 3-34 / 3-35.
+#         Myanmar DRD Road Design Standard adopts AASHTO values.
+#
+# Tuple layout: (K_crest_SSD, K_sag_SSD)
+#   K_crest: controls stopping sight distance over a crest.
+#   K_sag:   controls headlight sight distance in a sag.
+#
+# K_crest_PSD (passing sight distance, ~185 at 60 km/h) is implemented inside
+# vertical_alignment.py as an advisory-only check — NOT enforced as a hard
+# constraint at the preliminary design stage.
+VC_K_VALUES: dict[int, tuple[int, int]] = {
+    #  speed  K_crest  K_sag
+    40:  (4,    5),
+    60:  (11,  11),
+    80:  (26,  21),
+    100: (52,  37),
+    120: (98,  60),
+}
+
+# Maximum allowable sustained design grade per scenario (%).
+# Distinct from SLOPE_MAX_PCT which governs the 2-D routing cost surface;
+# this applies to the 3-D finished grade line.
+GRADE_MAX_PCT: dict[str, float] = {
+    "expressway":    6.0,   # Myanmar expressway standard
+    "rural_trunk":   8.0,   # Heavy truck design criterion
+    "mountain_road": 10.0,  # Switchback sections permitted
+}
+
+# Absolute minimum vertical curve length regardless of K·|A|.
+# AASHTO §3.4.1: 30 m is the absolute floor for any parabolic VC.
+MIN_VC_LENGTH_M: float = 30.0
+
+# Minimum distance between consecutive VPI candidates.
+# Reduces the number of VCs on long flat sections.  200 m is a reasonable
+# default for 60 km/h design (one VPI every ~3 seconds of travel at design speed).
+MIN_VPI_SPACING_M: float = 200.0
+
+# Output flags for Phase 6
+EXPORT_3D_GEOJSON: bool = True
+OUTPUT_FILE_3D: str = "preliminary_route_3d.geojson"
+
+# ── Phase 7: Earthwork Volumes ────────────────────────────────────────────────
+#
+# FORMATION_WIDTH_M: total subgrade width in metres = carriageway + both shoulders.
+# Myanmar DRD typical sections:
+#   rural_trunk  (2-lane): 7.0 m carriageway + 2×2.0 m shoulders = 11.0 m
+#   expressway   (4-lane): 2×(3.65 m×2 lanes) + 2×3.0 m shoulders = 20.6 m → use 24 m
+#   mountain_road (1.5-lane): 6.0 m carriageway + 2×1.0 m shoulders = 8.0 m
+FORMATION_WIDTH_M: dict[str, float] = {
+    "expressway":    24.0,
+    "rural_trunk":   11.0,
+    "mountain_road":  8.0,
+}
+
+# Cut batter slopes (H:V) by material class.
+# Applied uniformly in preliminary design — refine in detailed design with
+# geotechnical investigation.
+#   0.5  → hard / competent rock (stable near-vertical)
+#   1.0  → soft rock / stiff clay / laterite (DEFAULT)
+#   1.5  → residual soil / loose colluvium
+CUT_BATTER_HV: float = 1.0
+
+# Fill (embankment) batter slope (H:V).
+# Myanmar DRD standard 1.5H:1V for clay/laterite fill.
+# Use 2.0 for sandy or silty fills.
+FILL_BATTER_HV: float = 1.5
+
+# Material swell factor (bank m³ → loose m³).
+# Determines how much cut volume 'expands' when excavated.
+#   1.10 → dense clay
+#   1.25 → mixed soil / decomposed granite (DEFAULT)
+#   1.40 → fresh granite / basalt
+SWELL_FACTOR: float = 1.25
+
+# Output paths for Phase 7
+OUTPUT_EARTHWORK_CSV: str = "output/earthwork_volumes.csv"
+
+# ── Phase 8: Bridge and Culvert Inventory ─────────────────────────────────────
+#
+# BRIDGE_FREEBOARD_M: minimum clearance (m) between the design high-water level
+# and the underside of the bridge deck.  Myanmar DRD specifies 1.5 m for rural
+# trunk roads; ADB recommends 2.0 m for major rivers.
+BRIDGE_FREEBOARD_M: float = 1.5
+
+# BRIDGE_COST_PER_M2_USD: composite unit rate for bridge superstructure +
+# substructure (USD per m² of deck area).
+# Source: World Bank ROCKS Myanmar roads sector (2020–2024): USD 3,000–4,500/m².
+# Mid-range 3,500 used as preliminary estimate.
+BRIDGE_COST_PER_M2_USD: float = 3_500.0
+
+# BRIDGE_DECK_WIDTH_M: assumed total deck width = carriageway + guardwalls.
+# rural_trunk (2-lane): 11.0 m carriageway + 0.5 m per side = 12.0 m
+BRIDGE_DECK_WIDTH_M: float = 12.0
+
+# CULVERT_UNIT_COST_USD: lump-sum cost per culvert structure (box or pipe).
+# Myanmar DRD standard box culvert (1.2 m × 1.2 m × 12 m): ~USD 12,000–18,000.
+CULVERT_UNIT_COST_USD: float = 15_000.0
+
+# MIN_CULVERT_ACCUM_CELLS: minimum D8 flow-accumulation cell count to trigger
+# a culvert. At RESOLUTION=30 m, each cell ~ 900 m² catchment.
+# 200 cells → ~0.18 km² catchment → warrants a culvert.
+MIN_CULVERT_ACCUM_CELLS: int = 200
+
+# Output paths for Phase 8
+OUTPUT_STRUCTURES_CSV: str = "output/structures.csv"
+
 # ── Paths ─────────────────────────────────────────────────────────────────────
 DATA_DIR = "data"
 
 # ── External APIs ─────────────────────────────────────────────────────────────
 OPENTOPO_URL = "https://portal.opentopography.org/API/globaldem"
+
+# ── Phase 9: Parametric Cost Model ────────────────────────────────────────────
+#
+# Unit rates from Myanmar DRD schedule-of-rates and World Bank ROCKS 2020–2024.
+# All values are in USD; preliminary estimates with ±25% accuracy for ADB/WB
+# pre-feasibility studies.
+
+# Earthwork unit rates
+EARTHWORK_CUT_RATE_USD_M3: float  = 8.0
+EARTHWORK_FILL_RATE_USD_M3: float = 15.0
+
+# Pavement unit rate (flexible pavement, 50 mm AC on 200 mm granular base)
+# Myanmar DRD rural_trunk spec. USD 100–140/m²; default 120.
+PAVEMENT_RATE_USD_M2: float = 120.0
+
+# Land acquisition corridor width (m).
+# rural_trunk: 30 m formation + 2×15 m buffer = 60 m total strip.
+# ha acquired = length_km × 1000 × CORRIDOR_WIDTH_M / 10_000
+CORRIDOR_WIDTH_M: float = 60.0
+
+# Fallback land acquisition rate when LULC data is unavailable (USD/ha).
+LAND_ACQ_DEFAULT_USD_PER_HA: float = 7_500.0
+
+# Land acquisition rates by LULC category (USD/ha).
+# Sources: Myanmar Ministry of Agriculture 2022, DRD RAP guidelines,
+# ADB Resettlement Framework for Myanmar Roads Projects 2018.
+LAND_ACQ_RATES: dict = {
+    "national_park":  2_000.0, "protected_area": 2_000.0,
+    "nature_reserve": 2_500.0, "conservation":   2_500.0,
+    "mangrove":  3_000.0, "wetland":  3_000.0,
+    "swamp":     3_000.0, "mud":      2_000.0, "water": 1_000.0,
+    "forest":    5_000.0, "wood":     6_000.0, "scrub": 4_000.0,
+    "orchard":  12_000.0, "vineyard": 12_000.0, "rubber": 10_000.0,
+    "farmland":  8_000.0, "meadow":   6_000.0, "grass":  5_000.0,
+    "bare_rock": 3_000.0,
+    "urban": 15_000.0, "residential": 15_000.0,
+    "commercial": 15_000.0, "industrial": 12_000.0,
+}
+
+# Percentage cost factors applied to civil subtotal
+# Source: ADB standard contingency guidelines for preliminary design.
+ENV_MITIGATION_FACTOR: float = 0.03   # 3%  environmental mitigation
+CONTINGENCY_FACTOR:    float = 0.20   # 20% preliminary design contingency
+ENGINEERING_FACTOR:    float = 0.10   # 10% engineering, supervision, admin
+
+# Output paths for Phases 9–10
+OUTPUT_COST_CSV:    str = "output/cost_estimate.csv"
+OUTPUT_REPORT_HTML: str = "output/feasibility_report.html"
+OUTPUT_REPORT_PDF:  str = "output/feasibility_report.pdf"

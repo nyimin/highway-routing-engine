@@ -19,6 +19,7 @@ from config import (
     RUBBER_BAND_MACRO_W, RUBBER_BAND_MICRO_W,
     MIN_BRIDGE_SPACING_M, IMPASSABLE,
     COARSE_FACTOR, CORRIDOR_BAND_KM, FAST_MODE, ROUTING_ENGINE,
+    TURNING_ANGLE_FILTER_DEG,
 )
 
 log = logging.getLogger("highway_alignment")
@@ -81,77 +82,178 @@ def _find_path_fmm(cost, start_rc, end_rc):
 
 def _gradient_descent_path(travel_time, start_rc, end_rc, max_steps=100_000):
     """
-    Trace a path from end_rc back to start_rc by following the negative gradient
-    of the travel_time array. Steps are taken one grid cell at a time (8-connected).
+    Trace a path from end_rc back to start_rc using sub-pixel gradient descent
+    on the travel_time surface.
+
+    Uses np.gradient() for smooth derivative estimation, then rounds to the
+    nearest integer cell for the final path. The sub-pixel stepping produces
+    smoother trajectories than pure 8-connected integer stepping, eliminating
+    stair-step artifacts on continuous FMM travel-time fields.
     """
     rows, cols = travel_time.shape
-    r, c = end_rc
-    path = [(r, c)]
-    visited = set(path)
+    # Pre-compute gradients for the whole field (cheap, one-time)
+    grad_r, grad_c = np.gradient(travel_time)
+
+    r, c = float(end_rc[0]), float(end_rc[1])
+    path = [(end_rc[0], end_rc[1])]
+    visited = {(end_rc[0], end_rc[1])}
+    step_size = 0.8  # sub-pixel step (< 1.0 avoids overshooting)
+    stall = 0        # consecutive steps without visiting a new cell
+    max_stall = 50   # break if stuck oscillating in one cell
 
     for _ in range(max_steps):
-        if (r, c) == start_rc:
+        ri, ci = int(round(r)), int(round(c))
+        if (ri, ci) == tuple(start_rc):
             break
-        # Evaluate 8-connected neighbors
-        best_r, best_c = r, c
-        best_t = travel_time[r, c]
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if dr == 0 and dc == 0:
-                    continue
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < rows and 0 <= nc < cols and (nr, nc) not in visited:
-                    if travel_time[nr, nc] < best_t:
-                        best_t = travel_time[nr, nc]
-                        best_r, best_c = nr, nc
-        if (best_r, best_c) == (r, c):
-            break  # local minimum reached (shouldn't happen if FMM converged)
-        r, c = best_r, best_c
-        path.append((r, c))
-        visited.add((r, c))
+
+        # Clamp to grid bounds
+        ri_s = max(0, min(rows - 1, ri))
+        ci_s = max(0, min(cols - 1, ci))
+
+        # Get gradient at current position
+        gr = grad_r[ri_s, ci_s]
+        gc = grad_c[ri_s, ci_s]
+        mag = math.sqrt(gr * gr + gc * gc)
+        if mag < 1e-12:
+            # Gradient vanished — fall back to 8-connected neighbor search
+            best_r, best_c = ri_s, ci_s
+            best_t = travel_time[ri_s, ci_s]
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    nr, nc = ri_s + dr, ci_s + dc
+                    if 0 <= nr < rows and 0 <= nc < cols and (nr, nc) not in visited:
+                        if travel_time[nr, nc] < best_t:
+                            best_t = travel_time[nr, nc]
+                            best_r, best_c = nr, nc
+            if (best_r, best_c) == (ri_s, ci_s):
+                break
+            r, c = float(best_r), float(best_c)
+        else:
+            # Step in negative gradient direction (toward lower travel time)
+            r -= step_size * gr / mag
+            c -= step_size * gc / mag
+
+        # Clamp to grid
+        r = max(0.0, min(float(rows - 1), r))
+        c = max(0.0, min(float(cols - 1), c))
+
+        cell = (int(round(r)), int(round(c)))
+        if cell not in visited:
+            path.append(cell)
+            visited.add(cell)
+            stall = 0
+        else:
+            stall += 1
+            if stall >= max_stall:
+                log.debug(f"Gradient descent stalled at {cell} after {max_stall} "
+                          f"steps — breaking early.")
+                break
+
+    # Ensure start is included
+    if path[-1] != tuple(start_rc):
+        path.append(tuple(start_rc))
 
     path.reverse()  # start → end
     return path
 
 
+def _filter_sharp_reversals(path, max_turn_deg=TURNING_ANGLE_FILTER_DEG):
+    """
+    Remove waypoints that cause near-180° turns (stutter-step artifacts).
+
+    Walks the path and measures the interior angle at every triplet
+    (P[i-1], P[i], P[i+1]).  If the angle exceeds max_turn_deg (meaning
+    an almost-reversal), P[i] is dropped.
+
+    Preserves start and end points unconditionally.
+    """
+    if len(path) < 3:
+        return path
+
+    cos_threshold = math.cos(math.radians(max_turn_deg))
+    filtered = [path[0]]
+
+    for i in range(1, len(path) - 1):
+        r0, c0 = filtered[-1]
+        r1, c1 = path[i]
+        r2, c2 = path[i + 1]
+        v1r, v1c = r1 - r0, c1 - c0
+        v2r, v2c = r2 - r1, c2 - c1
+        mag1 = math.sqrt(v1r * v1r + v1c * v1c)
+        mag2 = math.sqrt(v2r * v2r + v2c * v2c)
+        if mag1 < 1e-9 or mag2 < 1e-9:
+            continue  # zero-length segment — skip
+        cos_angle = (v1r * v2r + v1c * v2c) / (mag1 * mag2)
+        # cos_angle close to -1 → reversal; if angle > threshold, drop it
+        if cos_angle < cos_threshold:
+            continue  # skip this waypoint (reversal)
+        filtered.append(path[i])
+
+    filtered.append(path[-1])
+    n_removed = len(path) - len(filtered)
+    if n_removed > 0:
+        log.info(f"Turning-angle filter: removed {n_removed} reversal points "
+                 f"(threshold {max_turn_deg}°)")
+    return filtered
+
+
 def find_path(cost, start_rc, end_rc):
     """
     Dispatcher: uses FMM if available and ROUTING_ENGINE allows it,
-    otherwise Dijkstra. Fully transparent to callers.
+    otherwise Dijkstra. Applies reversal filter to raw path.
     """
     use_fmm = _FMM_AVAILABLE and ROUTING_ENGINE in ('auto', 'fmm')
     if use_fmm:
-        return _find_path_fmm(cost, start_rc, end_rc)
-    return _find_path_dijkstra(cost, start_rc, end_rc)
+        raw = _find_path_fmm(cost, start_rc, end_rc)
+    else:
+        raw = _find_path_dijkstra(cost, start_rc, end_rc)
+    return _filter_sharp_reversals(raw)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # Rubber-band penalty (Phase 1 — normalised, numerically stable)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def apply_rubber_band_penalty(cost, start_rc, end_rc, weight):
+def apply_rubber_band_penalty(cost, start_rc, end_rc, weight, reference_mask=None):
     """
-    Multiplicative penalty pushing the router toward the straight-line chord.
-    perp_dist is normalised by corridor diagonal → scale-independent.
+    Multiplicative penalty pushing the router toward a reference line.
+    If reference_mask is provided (boolean array, True = reference path),
+    the penalty is based on the distance transform to that mask.
+    Otherwise, it defaults to the straight-line chord between start/end.
+    
     Max exponent capped at 3 (exp(3) ≈ 20×).
     """
+    if weight <= 0:
+        return cost
+
     rows, cols = cost.shape
     r0, c0 = start_rc
     r1, c1 = end_rc
-
-    y_grid, x_grid = np.mgrid[0:rows, 0:cols]
     len_sq = float((r1 - r0) ** 2 + (c1 - c0) ** 2)
-    if len_sq == 0:
-        return cost
 
-    t = ((y_grid - r0) * (r1 - r0) + (x_grid - c0) * (c1 - c0)) / len_sq
-    t = np.clip(t, 0.0, 1.0)
-    proj_r = r0 + t * (r1 - r0)
-    proj_c = c0 + t * (c1 - c0)
-    perp_dist_px = np.sqrt((y_grid - proj_r) ** 2 + (x_grid - proj_c) ** 2)
+    if reference_mask is not None:
+        # Distance transform to the reference mask (0 on the mask, >0 elsewhere)
+        from scipy.ndimage import distance_transform_edt
+        perp_dist_px = distance_transform_edt(~reference_mask)
+    else:
+        # Fallback to straight-line A->B distance
+        y_grid, x_grid = np.mgrid[0:rows, 0:cols]
+        if len_sq == 0:
+            return cost
+        t = ((y_grid - r0) * (r1 - r0) + (x_grid - c0) * (c1 - c0)) / len_sq
+        t = np.clip(t, 0.0, 1.0)
+        proj_r = r0 + t * (r1 - r0)
+        proj_c = c0 + t * (c1 - c0)
+        perp_dist_px = np.sqrt((y_grid - proj_r) ** 2 + (x_grid - proj_c) ** 2)
 
-    diag_px = math.sqrt(len_sq)
-    normalized_dist = perp_dist_px / max(diag_px, 1.0)
+    # Use bounding-box diagonal of the start/end extent rather than full grid
+    # diagonal. This prevents over-penalization on narrow corridors where the
+    # grid is much larger than the actual routing extent.
+    bb_diag = math.sqrt(float((r1 - r0) ** 2 + (c1 - c0) ** 2))
+    norm_diag = max(bb_diag, max(rows, cols) * 0.1, 1.0)  # floor to avoid near-zero
+    normalized_dist = perp_dist_px / norm_diag
     exponent = np.clip(normalized_dist * weight, 0.0, 3.0)
     return cost * np.exp(exponent)
 
@@ -272,28 +374,38 @@ def find_optimal_crossing(water_mask, macro_path, transform, resolution_m,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def two_pass_routing(cost, start_rc, end_rc, water_mask, transform,
-                      resolution_m=30, dem=None):
+                      resolution_m=30, dem=None, reference_mask=None):
     """
     Macro rubber-band → bridge siting → two micro-alignment passes.
     Called by coarse_to_fine_routing on the band-masked fine cost grid.
+    If reference_mask is provided, rubber-banding pulls toward that mask
+    (e.g. the coarse centerline) instead of the global straight line.
     """
     log.info("Macro rubber-band routing …")
-    macro_cost = apply_rubber_band_penalty(cost, start_rc, end_rc, weight=RUBBER_BAND_MACRO_W)
+    macro_cost = apply_rubber_band_penalty(
+        cost, start_rc, end_rc, weight=RUBBER_BAND_MACRO_W, reference_mask=reference_mask
+    )
     macro_path = find_path(macro_cost, start_rc, end_rc)
 
     bridge_rc = find_optimal_crossing(water_mask, macro_path, transform, resolution_m, dem=dem)
 
     if bridge_rc is None:
         log.info("No water crossing — single micro-alignment pass.")
-        micro_cost = apply_rubber_band_penalty(cost, start_rc, end_rc, weight=RUBBER_BAND_MICRO_W)
+        micro_cost = apply_rubber_band_penalty(
+            cost, start_rc, end_rc, weight=RUBBER_BAND_MICRO_W, reference_mask=reference_mask
+        )
         return find_path(micro_cost, start_rc, end_rc)
 
     log.info("Micro alignment 2a: Origin → Bridge …")
-    mc1 = apply_rubber_band_penalty(cost, start_rc, bridge_rc, weight=RUBBER_BAND_MICRO_W)
+    mc1 = apply_rubber_band_penalty(
+        cost, start_rc, bridge_rc, weight=RUBBER_BAND_MICRO_W, reference_mask=reference_mask
+    )
     path1 = find_path(mc1, start_rc, bridge_rc)
 
     log.info("Micro alignment 2b: Bridge → Destination …")
-    mc2 = apply_rubber_band_penalty(cost, bridge_rc, end_rc, weight=RUBBER_BAND_MICRO_W)
+    mc2 = apply_rubber_band_penalty(
+        cost, bridge_rc, end_rc, weight=RUBBER_BAND_MICRO_W, reference_mask=reference_mask
+    )
     path2 = find_path(mc2, bridge_rc, end_rc)
 
     full_path = path1 + path2[1:]
@@ -342,21 +454,27 @@ def _build_fine_band_mask(coarse_path, coarse_shape, fine_shape, factor, band_km
 
     # Upsample: each coarse cell → factor × factor fine cells
     fine_band = np.repeat(np.repeat(coarse_band, factor, axis=0), factor, axis=1)
+    
+    # Also create a mask for JUST the upsampled central path (for rubber-banding)
+    fine_centerline = np.repeat(np.repeat(coarse_mask, factor, axis=0), factor, axis=1)
 
     # Crop or pad to exactly match fine_shape
     fr, fc = fine_shape
     if fine_band.shape[0] >= fr and fine_band.shape[1] >= fc:
         fine_band = fine_band[:fr, :fc]
+        fine_centerline = fine_centerline[:fr, :fc]
     else:
         padded = np.zeros(fine_shape, dtype=bool)
+        padded_center = np.zeros(fine_shape, dtype=bool)
         h = min(fine_band.shape[0], fr)
         w = min(fine_band.shape[1], fc)
         padded[:h, :w] = fine_band[:h, :w]
-        # Always include start/end endpoints
+        padded_center[:h, :w] = fine_centerline[:h, :w]
         fine_band = padded
+        fine_centerline = padded_center
 
     # Guarantee endpoints are always inside the band (safety margin)
-    return fine_band
+    return fine_band, fine_centerline
 
 
 def _clamp_rc(rc, shape):
@@ -409,13 +527,15 @@ def coarse_to_fine_routing(cost, start_rc, end_rc, water_mask, transform,
         fine_path = [_clamp_rc(rc, (rows, cols)) for rc in fine_path]
         return fine_path
 
-    # ── Build band mask ────────────────────────────────────────────────────
-    fine_band = _build_fine_band_mask(
+    # ── Build band mask & centerline mask ─────────────────────────────────
+    fine_band, fine_centerline = _build_fine_band_mask(
         coarse_path, coarse_shape, (rows, cols), factor, band_km, resolution_m
     )
     # Always include the exact endpoint cells
     fine_band[start_rc[0], start_rc[1]] = True
     fine_band[end_rc[0],   end_rc[1]]   = True
+    fine_centerline[start_rc[0], start_rc[1]] = True
+    fine_centerline[end_rc[0],   end_rc[1]]   = True
 
     coverage_pct = fine_band.sum() / fine_band.size * 100
     log.info(f"Corridor band: {fine_band.sum():,} cells ({coverage_pct:.1f}% of fine grid), "
@@ -426,8 +546,8 @@ def coarse_to_fine_routing(cost, start_rc, end_rc, water_mask, transform,
     banded_water = np.where(fine_band, water_mask, 0).astype(water_mask.dtype)
 
     # ── Fine two-pass routing within band ─────────────────────────────────
-    log.info("Fine routing within corridor band …")
+    log.info("Fine routing within corridor band (with centerline rubber-banding) …")
     return two_pass_routing(
         banded_cost, start_rc, end_rc, banded_water, transform,
-        resolution_m=resolution_m, dem=dem,
+        resolution_m=resolution_m, dem=dem, reference_mask=fine_centerline
     )

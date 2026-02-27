@@ -4,3 +4,6 @@ data/
 cache/
 output/
 *.geojson
+.env
+*.log
+run_checkpoint.json

@@ -1,11 +1,10 @@
 """
 cost_surface.py — Raster cost model for Myanmar highway alignment
 =================================================================
-Phase 4 additions:
-  5. compute_aspect() — DEM slope direction (0–360°, N=0, clockwise).
-  6. compute_sidehill_penalty() — cross-slope instability multiplier
-     based on angle between travel bearing (A→B) and slope aspect.
-  7. build_cost_surface() now accepts bearing_deg to apply sidehill layer.
+Phase 5.1 additions:
+  5. Existing Road Discount — encourages route to follow tracks.
+  6. LULC Penalty — multiplicative cost for environmental barriers 
+     (wetlands, forests) derived from OSM natural/landuse.
 
 Phase 1/2 layers retained:
   1. Nonlinear 4-zone slope cost.
@@ -25,7 +24,9 @@ from rasterio.features import rasterize
 from config import (
     SLOPE_OPTIMAL_PCT, SLOPE_MODERATE_PCT, SLOPE_MAX_PCT, SLOPE_CLIFF_PCT,
     IMPASSABLE, WATER_PENALTY_TIERS, BORDER_CELLS, DEM_NODATA_SENTINEL,
-    BUILDING_PENALTY
+    ROAD_CLASS_DISCOUNTS, ROW_CORRIDOR_BUFFER_M, ROW_CORRIDOR_BUFFER_DISCOUNT,
+    LULC_PENALTIES, LULC_UNMAPPED_BASE, SLOPE_LULC_INTERACT, LULC_EDGE_DECAY_M,
+    BUILDING_BASE_PENALTY, BUILDING_AREA_MULT, BUILDING_MAX_PENALTY, ROW_BUFFER_M
 )
 
 log = logging.getLogger("highway_alignment")
@@ -127,6 +128,226 @@ def rasterise_layer(gdf_utm, transform, shape, value=1.0):
         )
         np.maximum(burned, chunk_burned, out=burned)
         
+    return burned
+
+# ── Building Expropriation Penalties ─────────────────────────────────────────
+
+def _apply_building_penalties(buildings_gdf, transform, shape, resolution_m=30):
+    """
+    Generate an area-based penalty map for buildings with a concentric distance decay.
+    """
+    from scipy.ndimage import distance_transform_edt
+    log.info("Building penalties: starting …")
+    penalty_map = np.zeros(shape, dtype=np.float32)
+    
+    if buildings_gdf is None or len(buildings_gdf) == 0:
+        return penalty_map
+
+    buildings = buildings_gdf.copy()
+    buildings['area_sqm'] = buildings.geometry.area
+    buildings['peak_penalty'] = (
+        BUILDING_BASE_PENALTY + buildings['area_sqm'] * BUILDING_AREA_MULT
+    ).clip(upper=BUILDING_MAX_PENALTY)
+
+    log.info("Building penalties: peak penalties calculated.")
+
+    # Use `.envelope` to reduce complex OSM polygons to simple bounding boxes.
+    # At 30m resolution, this approximation adds minimal error but radically speeds up `rasterize`.
+    geoms = buildings.geometry.envelope.tolist()
+    chunk_size = 50000
+    binary_mask = np.zeros(shape, dtype=np.float32)
+    
+    log.info(f"Building penalties: rasterizing {len(geoms)} footprints in chunks …")
+    for i in range(0, len(geoms), chunk_size):
+        chunk = geoms[i : i + chunk_size]
+        log.info(f"Building penalties: rasterizing chunk {i}–{i+len(chunk)} …")
+        chunk_mask = rasterize(
+            chunk,
+            out_shape=shape,
+            transform=transform,
+            fill=0.0,
+            default_value=1.0,
+            dtype=np.float32,
+            all_touched=True
+        )
+        np.maximum(binary_mask, chunk_mask, out=binary_mask)
+        
+    log.info("Building penalties: computing base penalty raster …")
+    mean_peak_penalty = buildings['peak_penalty'].mean()
+    base_penalty_raster = binary_mask * mean_peak_penalty
+
+    empty_mask = (base_penalty_raster == 0)
+    
+    if not np.any(empty_mask):
+         return base_penalty_raster
+
+    if np.all(empty_mask):
+         return penalty_map
+         
+    log.info("Building penalties: computing EDT distance decay …")
+    distances_px, indices = distance_transform_edt(empty_mask, return_indices=True)
+    distances_m = distances_px * resolution_m
+    
+    log.info("Building penalties: extracting nearest peak penalties …")
+    nearest_peak_penalty = base_penalty_raster[tuple(indices)]
+    
+    log.info("Building penalties: computing decay weights …")
+    weights = np.zeros(shape, dtype=np.float32)
+    weights[distances_m == 0] = 1.0
+    
+    mask1 = (distances_m > 0) & (distances_m <= ROW_BUFFER_M * 0.33)
+    weights[mask1] = 0.6
+    
+    mask2 = (distances_m > ROW_BUFFER_M * 0.33) & (distances_m <= ROW_BUFFER_M * 0.66)
+    weights[mask2] = 0.3
+    
+    mask3 = (distances_m > ROW_BUFFER_M * 0.66) & (distances_m <= ROW_BUFFER_M)
+    weights[mask3] = 0.1
+    
+    penalty_map = nearest_peak_penalty * weights
+    
+    log.info(f"Building penalties: complete. "
+             f"Cells with penalty > 0: {np.sum(penalty_map > 0):,}, "
+             f"max penalty: {penalty_map.max():.0f}")
+    return penalty_map
+
+
+# ── Phase 5.4: LULC Penalties (slope interaction + EDT boundary decay) ────────
+
+def _apply_lulc_penalties(lulc_gdf, transform, shape, slope_pct=None):
+    """
+    Build a float32 LULC cost-multiplier raster with three layers of refinement:
+
+    1. Per-class penalty rasterisation
+       Each geometry is paired with its LULC_PENALTIES multiplier (max wins
+       on overlaps).  Tag precedence: natural > landuse > leisure > boundary.
+
+    2. Background base multiplier (LULC_UNMAPPED_BASE)
+       Cells outside every LULC polygon receive LULC_UNMAPPED_BASE (default
+       1.15) instead of 1.0.  Rationale: in Myanmar, unmapped terrain is far
+       more likely to be secondary forest or scrub than clear open farmland.
+       OSM LULC coverage is severely incomplete; this prevents the router from
+       treating unmapped jungle as penalty-free greenfield.
+
+    3. Slope × LULC interaction (SLOPE_LULC_INTERACT)
+       Multiplies each cell's LULC value by (1 + SLOPE_LULC_INTERACT * t),
+       where t = clamp(slope_pct / SLOPE_MODERATE_PCT, 0, 1).  Steep terrain
+       amplifies LULC cost because access roads, drainage, and slope-stability
+       risk all grow non-linearly with gradient in vegetated terrain.
+
+    4. EDT boundary soft transition (LULC_EDGE_DECAY_M)
+       Hard polygon edges create 1-cell cost cliffs that can cause the router
+       to hug LULC boundaries (cheapest cell just outside the penalty zone).
+       An EDT-based linear ramp over LULC_EDGE_DECAY_M smoothly blends the
+       penalty down to LULC_UNMAPPED_BASE at the transition distance, removing
+       boundary-hugging artefacts.
+
+    Args:
+        lulc_gdf   : GeoDataFrame with LULC polygons (UTM CRS)
+        transform  : rasterio affine transform
+        shape      : (rows, cols) tuple
+        slope_pct  : float32 slope-percent raster; pass None to skip step 3
+
+    Returns:
+        float32 array, shape == shape, values >= LULC_UNMAPPED_BASE
+    """
+    rows, cols = shape
+
+    # Step 1: Rasterise per-class penalties
+    # Start with background = LULC_UNMAPPED_BASE (not 1.0) so unmapped terrain
+    # is nudged above the fully-open-land baseline.
+    burned = np.full(shape, LULC_UNMAPPED_BASE, dtype=np.float32)
+
+    if lulc_gdf is None or len(lulc_gdf) == 0:
+        log.warning(
+            "LULC GeoDataFrame is empty — no penalties applied beyond "
+            f"LULC_UNMAPPED_BASE={LULC_UNMAPPED_BASE:.2f}. "
+            "This is expected if OSM returned zero LULC polygons; see "
+            "OSM_LULC_WARN_THRESHOLD in config.py."
+        )
+        return burned
+
+    shapes = []
+    for _, row in lulc_gdf.iterrows():
+        geom = row.geometry
+        if geom is None or geom.is_empty:
+            continue
+
+        # Tag precedence: natural > landuse > leisure > boundary.
+        # Higher specificity tags override more general ones.
+        penalty = LULC_UNMAPPED_BASE  # floor
+        for tag_key in ("natural", "landuse", "leisure", "boundary"):
+            val = row.get(tag_key)
+            if val and val in LULC_PENALTIES:
+                penalty = max(penalty, LULC_PENALTIES[val])
+
+        if penalty > LULC_UNMAPPED_BASE:
+            shapes.append((geom, penalty))
+
+    if shapes:
+        chunk_size = 50_000
+        for i in range(0, len(shapes), chunk_size):
+            chunk = shapes[i : i + chunk_size]
+            chunk_burned = rasterize(
+                chunk,
+                out_shape=shape,
+                transform=transform,
+                fill=LULC_UNMAPPED_BASE,  # background = base, not 1.0
+                dtype=np.float32,
+            )
+            np.maximum(burned, chunk_burned, out=burned)  # keep highest penalty
+
+    n_penalised = int(np.sum(burned > LULC_UNMAPPED_BASE))
+    log.info(
+        f"LULC: {n_penalised:,} cells above background ({LULC_UNMAPPED_BASE}x), "
+        f"max multiplier={burned.max():.1f}x  [{len(shapes)} polygons rasterised]"
+    )
+
+    # Step 2: Slope × LULC interaction
+    # lulc_eff = lulc * (1 + SLOPE_LULC_INTERACT * t)  where t in [0,1]
+    if slope_pct is not None and SLOPE_LULC_INTERACT > 0:
+        t = np.clip(
+            slope_pct.astype(np.float32) / max(SLOPE_MODERATE_PCT, 0.01),
+            0.0, 1.0
+        )
+        interaction = 1.0 + SLOPE_LULC_INTERACT * t
+        burned = burned * interaction
+        max_interact = float(burned.max())
+        log.info(
+            f"LULC: slope×LULC interaction applied "
+            f"(SLOPE_LULC_INTERACT={SLOPE_LULC_INTERACT}); "
+            f"new max={max_interact:.1f}x"
+        )
+
+    # Step 3: EDT boundary soft transition
+    # Cells outside all polygons but within LULC_EDGE_DECAY_M of a polygon
+    # receive a linearly interpolated penalty between the polygon value and
+    # LULC_UNMAPPED_BASE, eliminating the hard 1-cell cost cliff at borders.
+    decay_px = max(1, int(LULC_EDGE_DECAY_M / 30))  # 30 m pixel size
+    if decay_px > 0:
+        # Binary mask: 1 where any LULC polygon was burned
+        poly_mask = (burned > (LULC_UNMAPPED_BASE * 1.001)).astype(np.uint8)
+        if poly_mask.any():
+            dist_px, nearest_idx = distance_transform_edt(
+                ~poly_mask.astype(bool), return_indices=True
+            )
+            in_decay = (dist_px > 0) & (dist_px <= decay_px)
+            if np.any(in_decay):
+                # Linearly interpolate: weight=1 at polygon edge, 0 at decay_px
+                w = 1.0 - (dist_px[in_decay] / decay_px)
+                nearest_val = burned[
+                    nearest_idx[0][in_decay],
+                    nearest_idx[1][in_decay]
+                ]
+                # Apply weighted blend toward nearest polygon penalty
+                decayed = LULC_UNMAPPED_BASE + w * (nearest_val - LULC_UNMAPPED_BASE)
+                # Only raise, never lower (the background is already UNMAPPED_BASE)
+                burned[in_decay] = np.maximum(burned[in_decay], decayed.astype(np.float32))
+            log.info(
+                f"LULC: EDT boundary decay applied over {LULC_EDGE_DECAY_M} m "
+                f"({decay_px} px) — {np.sum(in_decay):,} transition cells smoothed."
+            )
+
     return burned
 
 
@@ -253,89 +474,135 @@ def compute_landslide_susceptibility(slope_pct, curvature, resolution_m):
                  f"(max multiplier applied: {multiplier[multiplier > 1.0].max():.1f}×)")
     return multiplier
 
-# ── Phase 4: Aspect and sidehill penalty ──────────────────────────────────────
+# ── Phase 5.4: Class-based road discount + ROW corridor buffer ────────────────
 
-def compute_aspect(dem, resolution_m):
+def _apply_road_discounts(roads_gdf, roads_mask, cost, transform, shape, resolution_m=30):
     """
-    Compute terrain aspect (direction of steepest descent) in degrees.
-    Convention: 0° = North, 90° = East, 180° = South, 270° = West (clockwise).
-    Returns array in range [0, 360).
+    Apply a two-tier road cost discount:
+
+    Tier 1 — Per-class multiplier on road centreline cells
+        Each cell in roads_mask is multiplied by the discount for its OSM
+        highway= class (from ROAD_CLASS_DISCOUNTS).  Where multiple road
+        classes overlap a cell, the best (lowest) multiplier wins.
+        Cells at IMPASSABLE (cliff) are never discounted — a misaligned GPS
+        trace on a cliff face does not make the cliff passable.
+
+    Tier 2 — ROW corridor buffer on adjacent greenfield cells
+        Cells within ROW_CORRIDOR_BUFFER_M of *any* road but not on the
+        centreline itself receive ROW_CORRIDOR_BUFFER_DISCOUNT (default 0.88×).
+        This reflects that land inside an established right-of-way strip has
+        already been surveyed and may be partly cleared / accessible.
+
+        The buffer discount is intentionally conservative (0.88 rather than
+        0.80) because OSM centreline positions in Myanmar can drift 20–50 m;
+        aggressive discounting of adjacent cells risks rewarding GPS error
+        rather than real corridor access.
+
+    Args:
+        roads_gdf   : GeoDataFrame with 'highway' column (UTM CRS).  May be
+                      None if roads were loaded without retain_tags.
+        roads_mask  : float32 raster, > 0 where any road centreline exists
+        cost        : float64 cost surface array (modified in-place)
+        transform   : rasterio affine transform
+        shape       : (rows, cols)
+        resolution_m: pixel size in metres (used for buffer distance)
     """
-    dy, dx = np.gradient(dem.astype(np.float64), resolution_m)
-    # atan2(dx, dy) gives bearing of steepest descent in geographic convention
-    aspect_rad = np.arctan2(dx, dy)   # note: dx=east, dy=north
-    aspect_deg = np.degrees(aspect_rad) % 360.0
-    return aspect_deg.astype(np.float32)
+    if roads_mask is None or not np.any(roads_mask > 0):
+        return cost
 
+    # --- Tier 1: per-class centreline discount ---
+    # Start with the default for all road cells, then override per class.
+    class_discount = np.ones(shape, dtype=np.float32)
+    on_road = (roads_mask > 0)
 
-def compute_sidehill_penalty(slope_pct, aspect_deg, bearing_deg):
-    """
-    Anisotropic sidehill instability proxy.
+    # Default discount for any road cell (catches unmapped class= values)
+    class_discount[on_road] = ROAD_CLASS_DISCOUNTS["default"]
 
-    A highway at bearing `bearing_deg` (A→B azimuth) traversing a hillside at
-    90° to the slope direction creates:
-      • Higher cut/fill volumes than contouring or ridge-following
-      • Lateral drainage pressure on pavement
-      • Instability at the cut face
-
-    Cross-slope angle = deviation of travel direction from the slope’s
-    downhill direction, clamped to [0, 90°].
-
-    Multiplier schedule (only applied where slope > SLOPE_MODERATE_PCT):
-      0–30° cross-slope  → 1.0×  (following slope direction, i.e. ridge/valley)
-      30–60°             → 1.0–1.5× (partial sidehill)
-      60–90°             → 1.5–2.5× (full sidehill traverse — most expensive)
-
-    Note: this is a global approximation using the main A→B bearing.
-    A fully anisotropic implementation would require a directed graph.
-    """
-    # Angular difference between travel bearing and slope aspect,
-    # normalised to [0, 90°] (symmetric: going up or down slope equally preferred
-    # over sidehill)
-    diff = np.abs(aspect_deg - bearing_deg) % 360.0
-    # Fold: 0–180 (uphill/downhill range), then mirror to 0–90
-    diff = np.where(diff > 180.0, 360.0 - diff, diff)   # 0–180
-    cross_slope_deg = np.where(diff > 90.0, 180.0 - diff, diff)  # 0–90
-
-    # Only penalise cells where slope is significant
-    significant = slope_pct >= SLOPE_MODERATE_PCT
-
-    # Multiplier linearly interpolated from angle
-    # 0° → 1.0,  90° → 2.5
-    raw_mult = 1.0 + (cross_slope_deg / 90.0) * 1.5
-    # Extra amplification only when BOTH steep AND significantly sidehill (>30°)
-    # This prevents penalising following-slope traverses on steep terrain.
-    very_steep_sidehill = (slope_pct >= SLOPE_MAX_PCT) & (cross_slope_deg > 30.0)
-    raw_mult = np.where(very_steep_sidehill, raw_mult * 1.5, raw_mult)   # capped ≤ 3.75×
-
-    multiplier = np.where(significant, raw_mult, 1.0)
-
-    flagged = np.sum(multiplier > 1.2)
-    if flagged > 0:
+    if roads_gdf is not None and len(roads_gdf) > 0 and "highway" in roads_gdf.columns:
+        # Build a per-class raster by rasterising each highway value separately.
+        # Use the lowest multiplier where polygons overlap.
+        for hw_class, multiplier in ROAD_CLASS_DISCOUNTS.items():
+            if hw_class == "default":
+                continue
+            subset = roads_gdf[roads_gdf["highway"] == hw_class]
+            if len(subset) == 0:
+                continue
+            geoms = [g for g in subset.geometry if g is not None and not g.is_empty]
+            if not geoms:
+                continue
+            class_raster = rasterize(
+                [(g, multiplier) for g in geoms],
+                out_shape=shape,
+                transform=transform,
+                fill=1.0,   # non-road background = no discount
+                dtype=np.float32,
+            )
+            # np.minimum keeps the strongest discount (lowest multiplier)
+            np.minimum(class_discount, class_raster + (~on_road).astype(np.float32),
+                       out=class_discount)
         log.info(
-            f"Sidehill penalty: {flagged:,} cells with multiplier >1.2× "
-            f"(bearing={bearing_deg:.1f}°, moderate slope threshold={SLOPE_MODERATE_PCT}%)"
+            f"Road discounts: per-class multipliers applied to {on_road.sum():,} "
+            f"centreline cells  (classes: "
+            + ", ".join(
+                f"{k}={v}x" for k, v in ROAD_CLASS_DISCOUNTS.items() if k != "default"
+            ) + ")"
         )
-    return multiplier.astype(np.float64)
+    else:
+        log.info(
+            "Road discounts: no 'highway' column in GDF — using default "
+            f"discount {ROAD_CLASS_DISCOUNTS['default']}x for all road cells."
+        )
+
+    discounted = cost * class_discount
+    # Cliffs stay impassable regardless of road presence
+    cost = np.where(on_road, np.where(cost >= IMPASSABLE, cost, np.maximum(0.3, discounted)), cost)
+
+    # --- Tier 2: ROW corridor buffer ---
+    buffer_px = max(1, int(ROW_CORRIDOR_BUFFER_M / resolution_m))
+    if buffer_px > 0:
+        y_b, x_b = np.ogrid[-buffer_px:buffer_px + 1, -buffer_px:buffer_px + 1]
+        disk_b = (x_b ** 2 + y_b ** 2) <= buffer_px ** 2
+        from scipy.ndimage import binary_dilation
+        road_dilated = binary_dilation(on_road, structure=disk_b)
+        buffer_zone = road_dilated & ~on_road  # adjacent cells only, not centreline
+        # Apply partial discount only to greenfield (passable) buffer cells
+        passable_buffer = buffer_zone & (cost < IMPASSABLE)
+        cost = np.where(
+            passable_buffer,
+            cost * ROW_CORRIDOR_BUFFER_DISCOUNT,
+            cost
+        )
+        log.info(
+            f"Road ROW buffer: {buffer_px} px ({ROW_CORRIDOR_BUFFER_M} m), "
+            f"{ROW_CORRIDOR_BUFFER_DISCOUNT}x discount on "
+            f"{passable_buffer.sum():,} adjacent greenfield cells."
+        )
+
+    return cost
 
 
-
-
-def build_cost_surface(slope_pct, building_mask, water_mask, nodata_mask=None,
-                       dem=None, curvature=None, resolution_m=30, bearing_deg=None):
+def build_cost_surface(slope_pct, building_penalty_map, water_mask, roads_mask=None,
+                       roads_gdf=None, lulc_penalty_map=None, nodata_mask=None,
+                       dem=None, curvature=None, resolution_m=30, transform=None):
     """
     Assemble the full cost surface.
 
     Layers in order (multiplicative unless stated):
       1. Base slope cost (4-zone nonlinear)
       2. Landslide susceptibility multiplier (if curvature available)
-      3. Sidehill instability multiplier (Phase 4 — if bearing_deg provided)
-      4. River hierarchy penalty (additive)
-      5. Bridge abutment zone recovery
-      6. Floodplain amplification (3×)
-      7. Building exclusion (IMPASSABLE)
-      8. NoData exclusion  (IMPASSABLE)
-      9. Border exclusion  (IMPASSABLE)
+      3. Phase 5.4: Class-based Road Discount + ROW corridor buffer
+      4. Phase 5.4: LULC Environmental Penalty (incl. background base,
+         slope×interaction, EDT boundary decay)
+      5. River hierarchy penalty (additive)
+      6. Bridge abutment zone recovery
+      7. Floodplain amplification (3×)
+      8. Building exclusion/expropriation penalty (additive)
+      9. NoData / Border exclusion  (IMPASSABLE)
+
+    Args:
+        transform: rasterio affine transform — required for per-class road
+                   rasterisation (Tier 1 of road discounts).  If None, falls
+                   back to default discount for all road cells.
     """
     log.info("Building cost surface …")
     rows, cols = slope_pct.shape
@@ -348,13 +615,23 @@ def build_cost_surface(slope_pct, building_mask, water_mask, nodata_mask=None,
         landslide_mult = compute_landslide_susceptibility(slope_pct, curvature, resolution_m)
         cost *= landslide_mult
 
-    # ── 3. Sidehill instability (Phase 4) ─────────────────────────────────
-    # Penalises cells where the travel direction (A→B bearing) cuts across the
-    # slope at 60–90°.  Only applied when dem available and bearing is known.
-    if bearing_deg is not None and dem is not None:
-        aspect = compute_aspect(dem, resolution_m)
-        sidehill_mult = compute_sidehill_penalty(slope_pct, aspect, bearing_deg)
-        cost = np.where(cost < IMPASSABLE, cost * sidehill_mult, cost)
+    # ── 3. Phase 5.4: Class-based Road Discount + ROW Corridor Buffer ────
+    # Per-class multipliers + conservative 50 m buffer around all road corridors.
+    # See _apply_road_discounts() docstring for Myanmar OSM data-quality notes.
+    cost = _apply_road_discounts(
+        roads_gdf, roads_mask, cost, transform,
+        cost.shape, resolution_m
+    )
+
+    # ── 4. Phase 5.4: LULC Environmental Penalty ──────────────────────────
+    # lulc_penalty_map already includes: background base, slope×interaction,
+    # and EDT boundary decay (all applied in _apply_lulc_penalties).
+    if lulc_penalty_map is not None:
+        cost *= lulc_penalty_map
+        log.info(
+            f"LULC: multiplied into cost surface — "
+            f"{np.sum(lulc_penalty_map > LULC_UNMAPPED_BASE):,} cells above background."
+        )
 
     # ── 4. River hierarchy penalty ────────────────────────────────────────
     if np.any(water_mask > 0):
@@ -391,10 +668,10 @@ def build_cost_surface(slope_pct, building_mask, water_mask, nodata_mask=None,
         # 3× amplification — passable but costly (drainage structures, embankment)
         cost = np.where(floodplain & (cost < IMPASSABLE), cost * 3.0, cost)
 
-    # ── 6. Building exclusion ─────────────────────────────────────────────
-    # Buildings are now an expensive soft constraint (expropriation penalty)
-    # rather than impassable terrain.
-    cost = np.where(building_mask > 0, cost + BUILDING_PENALTY, cost)
+    # ── 6. Building exclusion/expropriation ───────────────────────────────
+    # Phase 5.2: Buildings use an area-based concentric penalty map instead of a flat penalty
+    if building_penalty_map is not None:
+        cost = cost + building_penalty_map
 
     # ── 7. NoData exclusion ───────────────────────────────────────────────
     if nodata_mask is not None:

@@ -1,64 +1,217 @@
-# Highway Alignment GIS Pipeline
+# Myanmar Highway Alignment Generator
 
-This project is an automated Python pipeline for finding the optimal (least-cost) path for a highway. It fetches elevation data (DEM) and infrastructure/water data (via OpenStreetMap APIs) to dynamically generate a cost surface and uses pathfinding algorithms to trace a realistic highway alignment.
+An automated Python pipeline for generating optimum-cost highway alignments.
+It fetches elevation (DEM) and infrastructure data (OpenStreetMap), builds a
+multi-layer cost surface, runs two-resolution pathfinding, and exports
+engineering-grade GeoJSON outputs with a 10-product visualization suite.
 
-## Core Features
+> **Current phase: 10** — parametric cost model and automated feasibility report complete (incorporating 3D VA, earthwork, and structures).
 
-- **Automated Data Fetching**: Retrieves standard Digital Elevation Models (DEM) via the OpenTopography API (COP30 → SRTM fallback chain) and vector features (buildings, water bodies) via OSMnx.
-- **Dynamic Cost Surface Generation**: Calculates slope from elevation data, applying heavy penalties to steep inclines while also buffering out buildings and defining "steep bank" abutment zones for water crossings. Includes anisotropic sidehill costs.
-- **DEM Stream Fallback**: Automatically derives a D8 flow accumulation stream network purely in numpy/scipy when OSM water data is sparse.
-- **Two-Pass "Macro-to-Micro" Routing**:
-  - **Coarse Pass**: A fast low-res pathfinding pass downsampled by \`COARSE_FACTOR\` to discover the general corridor.
-  - **Band Masking**: Carves an 8km safety corridor around the coarse route, stripping out 80%+ of the grid.
-  - **Fine Passes**: Two-pass micro-routing within the band. Applies a rubber band penalty to discover the most direct route, identifying optimal bridge control points and preventing meandering.
-  - **Routing Engine**: Transparently uses Scikit-FMM if available (for continuous terrain), otherwise Dijkstra.
-- **Geometry Checks**: Applies B-spline smoothing to the jagged grid-based Dijkstra path, computing clothoid transitions and strictly verifying minimum curve radii and maximum sustained grades.
-- **Stage Checkpointing**: Fault-tolerant execution. Results of each stage are cached in a local checkpoint file allowing pipeline restarts from the last completed stage.
-- **Performance & Memory Auto-tuning**: Uses \`numba\` JIT for critical loops. Estimates potential peak memory footprint before routing and auto-escalates \`COARSE_FACTOR\` to heavily reduce memory. Output includes detailed stage timing and peak memory metrics.
-- **GeoJSON Export**: Readily exports the final smoothed path into a standard GeoJSON format containing rich metadata for integration into external GIS software (QGIS, ArcGIS).
+---
+
+## Features
+
+### Data Acquisition
+
+- **DEM fallback chain**: COP30 → SRTMGL1 → SRTMGL3 → synthetic mock.
+- **OSM layers**: buildings, water bodies, roads/tracks, land-use/natural via Overpass.
+- **D8 stream fallback**: auto-derives a flow-accumulation stream network from the DEM when OSM water data is sparse.
+
+### Cost Surface
+
+- **Slope cost** with 4-zone thresholds (optimal / moderate / max / cliff) and exponential ramp.
+- **River hierarchy** — connected-component analysis classifies water into 5 tiers (culvert → Ayeyarwady-scale) with perpendicular crossing enforcement.
+- **Area-based building penalties** — footprint-scaled peak penalty with continuous EDT distance-decay gradient (Phase 5.2).
+- **LULC environmental multipliers** — wetland, forest, farmland, conservation areas.
+- **Road discount** — existing OSM tracks receive a 0.5× cost multiplier.
+
+### Routing
+
+- **Two-resolution coarse-to-fine** — coarse Dijkstra/FMM at `COARSE_FACTOR×` resolution, then fine micro-routing inside an 8 km corridor band.
+- **Rubber-band centering** — distance-transform penalty prevents meandering; bounding-box-diagonal normalization avoids over-penalization in narrow corridors.
+- **Sub-pixel FMM gradient descent** — eliminates grid stair-step artifacts (Phase 5.3).
+- **Sharp-reversal filter** — removes near-180° waypoint stutters (configurable via `TURNING_ANGLE_FILTER_DEG`).
+- **Bridge siting** — identifies optimal crossing points for tiered rivers with minimum inter-bridge spacing.
+- **Engine auto-selection**: `scikit-fmm` if available, otherwise Dijkstra.
+
+### Geometry & Vertical Alignment (Phase 6)
+
+- **B-spline smoothing** with clothoid transition analysis.
+- **Curve-radius verification** against design-speed minimums (e.g., 150 m at 60 km/h).
+- **Finished Grade Line (FGL)** vertical alignment with parabolic curves.
+- **Sustained-grade verification** and AASHTO stopping sight distance checks.
+
+### Volumetrics & Structures (Phases 7–8)
+
+- **Earthwork computation**: Trapezoidal cross-sections, Average-End-Area volumes, and Brückner mass-haul balancing.
+- **Structure inventory**: Shapely-based bridge geometric modeling over tier 3+ rivers.
+- **Culvert siting**: Identifying optimal drainage pipes at D8 vertical profile minima.
+
+### Cost & Reporting (Phases 9–10)
+
+- **Parametric Cost Model**: Aggregates earthwork, pavement, structures, and land acquisition (LULC-weighted) into a project USD cost.
+- **Automated Feasibility Report**: Jinja2 + WeasyPrint driven HTML/PDF generation presenting the executive summary, engineering profiles, and cost estimate.
+
+### Performance
+
+- **Memory auto-tuning** — estimates peak memory before routing; auto-doubles `COARSE_FACTOR` if it exceeds `MEMORY_WARN_GB`.
+- **Numba JIT** acceleration via `try_jit` decorator (optional install).
+- **Stage checkpointing** — fault-tolerant restart from last completed stage.
+- **Per-stage timing + `tracemalloc` peak tracking**.
+
+### Visualization Suite
+
+Automatically generates 12 diagnostic products after routing:
+
+| #   | Output                    | Description                                                                             |
+| --- | ------------------------- | --------------------------------------------------------------------------------------- |
+| 1   | `cost_heatmap.png`        | Log-scaled unified cost surface + route overlay                                         |
+| 2   | `building_decay.png`      | Zoomed EDT decay rings around densest building cluster                                  |
+| 3   | `layer_decomposition.png` | 2×3 panel of individual cost layers                                                     |
+| 4   | `elevation_profile.png`   | Longitudinal profile with grade-violation bands                                         |
+| 5   | `slope_histogram.png`     | Slope distribution with 4-zone thresholds                                               |
+| 6   | `cost_along_route.png`    | Per-waypoint cost + dominant-layer indicator                                            |
+| 7   | `route_3d.png`            | 3D terrain drape (downsampled, vertical exaggeration)                                   |
+| 8   | `cross_sections.png`      | 4 perpendicular terrain slices at key chainage                                          |
+| 9   | `route_dashboard.png`     | Statistics summary card + terrain pie chart                                             |
+| 10  | `route_map.html`          | Interactive Folium/Leaflet map with slope-coded route, toggleable building/water layers |
+| 11  | `vertical_profile.png`    | Finished Grade Line (FGL) vs terrain with parabolic VCs                                 |
+| 12  | `earthwork_masshual.png`  | Depth profile, cumulative volumes, and Brückner mass-haul diagram                       |
+
+### Export
+
+- `preliminary_route.geojson` — smoothed alignment with full metadata.
+- `output/cost_estimate.csv` — itemised cost quantities.
+- `output/feasibility_report.html` (and `.pdf`) — 6-page A4 Feasibility Report.
+- Optional intermediate GeoTIFFs (`cost_surface.tif`, `building_penalty.tif`).
+
+---
 
 ## Project Structure
 
-The monolithic pipeline has been extracted into a modular package architecture:
+```
+├── main.py                  # Pipeline orchestrator
+├── config.py                # All constants: coordinates, slopes, penalties, unit rates
+├── data_fetch.py            # DEM download, OSM queries, D8 streams
+├── cost_surface.py          # Multi-layer cost raster
+├── routing.py               # Coarse-to-fine routing, gradient descent, filters
+├── geometry_utils.py        # Coordinate transforms, B-spline, geometry verification
+├── vertical_alignment.py    # Grade-clipping FGL, parabolic VC fitting, SSD check
+├── earthwork.py             # Trapezoidal cross-sections, AEA volumes, mass-haul
+├── structures.py            # Bridge/culvert detection and cost estimation
+├── cost_model.py            # Parametric cost aggregation
+├── report.py                # Jinja2/WeasyPrint feasibility report generator
+├── visualize_route.py       # 12-product visualization suite
+├── templates/               # Jinja2 templates (report.html)
+├── requirements_alignment.txt
+├── .env                     # OPENTOPOGRAPHY_API_KEY (not committed)
+├── data/                    # Cached DEMs and GeoPackages
+├── cache/                   # OSM query cache
+├── output/                  # Visualizations, GeoTIFFs, HTML map
+└── test_*.py                # 35 deterministic unit tests
+```
 
-- `main.py`: The entry point and central orchestrator script coordinating all other modules, featuring a fault-tolerant CheckpointManager and performance tracking.
-- `config.py`: Stores all configuration variables, route coordinates, engineering constants (max slope, minimum radius, setback), and cost penalties.
-- `data_fetch.py`: Handles downloading API responses for raster (DEM) and vector (OSM). Derives D8 stream flow accumulations for hydrology fallback.
-- `cost_surface.py`: Generates the friction/cost array. Computes slopes, creates exclusion zones around infrastructure, enforces water-crossing rules, and calculates sidehill aspect costs.
-- `routing.py`: Contains coarse-to-fine band masking, bridge siting, and two-pass routing using Scikit-FMM or Dijkstra.
-- `geometry_utils.py`: Converts coordinates, manages B-spline smoothing, verifies curve radii, calculates clothoid transitions, and exports to GeoJSON.
-- `jit_utils.py`: A `try_jit` decorator wrapper that accelerates key bottlenecks with `numba` if it is installed, operating as a zero-overhead pass-through if not.
-- `visualize_route.py`: Utility script to generate top-down map images (`route_overview.png`, `route_start.png`, `route_end.png`) out of the generated data.
-- `output/`: Directory where visualization PNG files will be saved.
-- `data/`: Directory where downloaded DEMs and Geopackages are cached.
+---
 
 ## Requirements
 
-You must have an OpenTopography API key to fetch DEM data correctly. Keep this in a `.env` file in the root project directory:
+**Python 3.9+**
+
+### API Key
+
+An [OpenTopography](https://opentopography.org/) API key is required for DEM downloads.
+Create a `.env` file in the project root:
 
 ```env
 OPENTOPOGRAPHY_API_KEY=your_api_key_here
 ```
 
-Requires Python 3.9+. Install the dependencies using:
+### Install Dependencies
 
 ```bash
 pip install -r requirements_alignment.txt
-pip install matplotlib  # for visualization
 ```
 
-_Note: You can greatly accelerate the pipeline by installing optional dependencies like `numba` and `scikit-fmm`._
+### Optional Add-ons
+
+```bash
+pip install scikit-fmm    # Smoother FMM paths (recommended)
+pip install numba>=0.57   # 10–50× speedup on cost surface loops
+pip install weasyprint jinja2 # Required for PDF/HTML report generation
+```
+
+---
 
 ## Usage
 
-1. **Verify coordinates and settings**: Open `config.py` to inspect the origin point (`START_LON`, `START_LAT`), destination point (`END_LON`, `END_LAT`), and various pathfinding configuration variables.
-2. **Execute the pipeline**:
-   ```bash
-   python main.py
-   ```
-   This will download data (if not cached), generate the cost surface, trace the path, and save it to `preliminary_route.geojson`.
-3. **Generate Visualizations**:
-   ```bash
-   python visualize_route.py
-   ```
-   This will render plots of the route and save them as PNGs into the `output/` folder.
+### 1. Configure
+
+Edit `config.py` to set your start/end coordinates (`POINT_A`, `POINT_B`), UTM zone
+(`UTM_EPSG`), resolution, slope thresholds, and feature flags:
+
+```python
+EXPORT_INTERMEDIATES     = True   # Save cost_surface.tif, building_penalty.tif
+GENERATE_VISUALIZATIONS  = True   # Auto-run the 10-product viz suite
+FAST_MODE                = False  # True = coarse-only (300 m) for rapid screening
+ROUTING_ENGINE           = 'auto' # 'auto' | 'fmm' | 'dijkstra'
+```
+
+### 2. Run
+
+```bash
+python main.py
+```
+
+The pipeline will:
+
+1. Download / cache DEM and OSM data.
+2. Build the multi-layer cost surface.
+3. Run coarse → fine routing and verify geometry.
+4. Compute 3D vertical alignment, earthwork volumes, and structure inventory.
+5. Compute the parametric cost model and generate the feasibility report.
+6. Export visuals, GeoJSON, CSVs, and the final HTML/PDF report.
+
+### 3. Inspect Outputs
+
+- Open `preliminary_route.geojson` in QGIS or [geojson.io](https://geojson.io).
+- Open `output/route_map.html` in a browser for the interactive slope-coded map.
+- Review the PNG suite in `output/` for engineering diagnostics.
+
+---
+
+## Configuration Reference
+
+| Constant                   | Default               | Description                            |
+| -------------------------- | --------------------- | -------------------------------------- |
+| `RESOLUTION`               | 30                    | Grid cell size (metres)                |
+| `COARSE_FACTOR`            | 10                    | Coarse-pass downsampling ratio         |
+| `CORRIDOR_BAND_KM`         | 8.0                   | Fine-routing corridor half-width (km)  |
+| `SLOPE_MAX_PCT`            | 12                    | Maximum design slope (%)               |
+| `SLOPE_CLIFF_PCT`          | 25                    | Impassable cliff threshold (%)         |
+| `TURNING_ANGLE_FILTER_DEG` | 160                   | Filter near-reversal waypoints (°)     |
+| `MEMORY_WARN_GB`           | 4.0                   | Auto-escalate coarse factor above this |
+| `WATER_PENALTY_TIERS`      | [5,50,500,5000,50000] | Per-tier river crossing multipliers    |
+| `ROAD_DISCOUNT`            | 0.5                   | Existing-road cost multiplier          |
+
+See `config.py` for the full list.
+
+---
+
+## Tests
+
+We maintain a suite of 35 deterministic unit tests across all phases:
+
+```bash
+# E.g. test geometric checks, cost model logic, report templating
+python test_earthwork.py
+python test_vertical_alignment.py
+python test_structures.py
+python test_cost_model.py
+python test_report.py
+```
+
+---
+
+## License
+
+Internal project — not licensed for public distribution.

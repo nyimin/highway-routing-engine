@@ -27,15 +27,39 @@ from config import (
     CHECKPOINT_FILE, FORCE_RESTART,
     MEMORY_WARN_GB, TILE_ROUTING_THRESHOLD_KM, PERF_TIMING_ENABLED,
     COARSE_FACTOR, CORRIDOR_BAND_KM,
+    EXPORT_INTERMEDIATES, GENERATE_VISUALIZATIONS,
+    SLOPE_OPTIMAL_PCT, SLOPE_MODERATE_PCT, SLOPE_CLIFF_PCT,
+    ROAD_CLASS_DISCOUNTS,
+    # Phase 6
+    EXPORT_3D_GEOJSON, OUTPUT_FILE_3D,
+    VC_K_VALUES, GRADE_MAX_PCT, MIN_VC_LENGTH_M, MIN_VPI_SPACING_M,
+    SCENARIO_PROFILE, DESIGN_SPEED_KMPH,
+    # Phase 7
+    FORMATION_WIDTH_M, CUT_BATTER_HV, FILL_BATTER_HV, SWELL_FACTOR,
+    OUTPUT_EARTHWORK_CSV,
+    # Phase 8
+    BRIDGE_FREEBOARD_M, BRIDGE_COST_PER_M2_USD, BRIDGE_DECK_WIDTH_M,
+    CULVERT_UNIT_COST_USD, MIN_CULVERT_ACCUM_CELLS, OUTPUT_STRUCTURES_CSV,
+    # Phase 9
+    EARTHWORK_CUT_RATE_USD_M3, EARTHWORK_FILL_RATE_USD_M3, PAVEMENT_RATE_USD_M2,
+    CORRIDOR_WIDTH_M, LAND_ACQ_DEFAULT_USD_PER_HA, LAND_ACQ_RATES,
+    ENV_MITIGATION_FACTOR, CONTINGENCY_FACTOR, ENGINEERING_FACTOR,
+    OUTPUT_COST_CSV,
+    # Phase 10
+    OUTPUT_REPORT_HTML, OUTPUT_REPORT_PDF,
 )
 from geometry_utils import (
     bbox_with_margin, wgs84_to_utm, utm_to_wgs84, xy_to_rowcol, rowcol_to_xy,
     smooth_path, verify_curve_radius, verify_row_setback, compute_metadata,
-    export_geojson, extract_longitudinal_profile, check_sustained_grade,
+    export_geojson, export_geojson_3d,
+    extract_longitudinal_profile, check_sustained_grade,
     compute_bearing, compute_clothoid_transitions,
 )
 from data_fetch import fetch_dem, fetch_osm_layers, derive_stream_mask_utm
-from cost_surface import compute_slope, rasterise_layer, build_cost_surface
+from cost_surface import (
+    compute_slope, rasterise_layer, build_cost_surface,
+    _slope_cost_array, _river_hierarchy_penalties,
+)
 from routing import coarse_to_fine_routing
 
 log = logging.getLogger("highway_alignment")
@@ -203,7 +227,7 @@ def main():
 
     # ── 3. OSM layers ──────────────────────────────────────────────────────
     log.info("Fetching OSM layers …")
-    buildings_wgs, water_wgs, osm_stats = fetch_osm_layers(bbox)
+    buildings_wgs, water_wgs, roads_wgs, lulc_wgs, osm_stats = fetch_osm_layers(bbox)
 
     def to_utm(gdf):
         if gdf is None or len(gdf) == 0:
@@ -212,11 +236,12 @@ def main():
 
     buildings_utm = to_utm(buildings_wgs)
     water_utm     = to_utm(water_wgs)
+    roads_utm     = to_utm(roads_wgs)
+    lulc_utm      = to_utm(lulc_wgs)
 
     if buildings_utm is not None and len(buildings_utm) > 0:
-        log.info(f"Buffering {len(buildings_utm)} buildings by {ROW_BUFFER_M} m …")
-        buildings_utm = buildings_utm.copy()
-        buildings_utm["geometry"] = buildings_utm.geometry.buffer(ROW_BUFFER_M)
+        log.info(f"Loaded {len(buildings_utm)} buildings.")
+
 
     # ── 4. Slope + curvature ───────────────────────────────────────────────
     log.info("Computing slope and curvature …")
@@ -227,12 +252,33 @@ def main():
     )
 
     # ── 4b. A→B bearing (for anisotropic sidehill cost) ───────────────────
-    bearing_deg = compute_bearing(POINT_A, POINT_B)
-
+    # Removed global bearing sidehill logic as per Phase 5.1 audit.
+    
     # ── 5. Rasterise vector layers — merge with DEM stream fallback if needed ─
-    log.info("Rasterising exclusion zones …")
-    building_mask = rasterise_layer(buildings_utm, transform, (rows, cols))
+    log.info("Rasterising exclusion zones and environmental layers …")
+    
+    # Phase 5.2: Buildings now use an area-based concentric penalty map
+    building_penalty_map = np.zeros((rows, cols), dtype=np.float32)
+    if buildings_utm is not None and len(buildings_utm) > 0:
+        log.info(f"Applying building penalties to {len(buildings_utm)} buildings...")
+        from cost_surface import _apply_building_penalties
+        building_penalty_map = _apply_building_penalties(buildings_utm, transform, (rows, cols), RESOLUTION)
+
+    log.info("Rasterising water_mask...")
     water_mask    = rasterise_layer(water_utm,     transform, (rows, cols))
+    log.info("Rasterising roads_mask...")
+    roads_mask    = rasterise_layer(roads_utm,     transform, (rows, cols))
+    
+    # LULC is special because it has different categories. We'll pass the GDF directly
+    # or rasterise the penalties. Rasterising a single combined penalty map is best.
+    lulc_penalty_map = np.ones((rows, cols), dtype=np.float32)
+    if lulc_utm is not None and len(lulc_utm) > 0:
+        log.info("Applying LULC penalties (slope interaction + EDT decay) ...")
+        from cost_surface import _apply_lulc_penalties
+        # Pass slope_pct so the slope×LULC interaction and EDT decay are applied.
+        lulc_penalty_map = _apply_lulc_penalties(
+            lulc_utm, transform, (rows, cols), slope_pct=slope_pct
+        )
 
     # Phase 3: if OSM water is sparse, derive stream network from DEM
     if osm_stats.get('dem_stream_fallback'):
@@ -251,14 +297,82 @@ def main():
 
     # ── 6. Cost surface (all layers) ───────────────────────────────────────
     log.info("Building cost surface …")
+
+    # Pre-compute individual layer snapshots for the layer decomposition panel
+    slope_cost_layer = _slope_cost_array(slope_pct)
+
+    # Water hierarchy layer (for visualization)
+    water_layer = np.zeros((rows, cols), dtype=np.float64)
+    if np.any(water_mask > 0):
+        from scipy.ndimage import binary_closing
+        radius = 4
+        y_g, x_g = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+        disk = x_g ** 2 + y_g ** 2 <= radius ** 2
+        water_closed_viz = binary_closing(water_mask > 0, structure=disk)
+        water_layer = _river_hierarchy_penalties(
+            water_closed_viz.astype(np.float32), RESOLUTION
+        )
+
+    # Phase 5.4: Road discount viz — render per-class multiplier values so the
+    # layer decomposition panel shows a gradient, not a uniform flat blob.
+    road_layer = np.ones((rows, cols), dtype=np.float32)
+    if roads_mask is not None and np.any(roads_mask > 0) and roads_utm is not None:
+        if len(roads_utm) > 0 and "highway" in roads_utm.columns:
+            from rasterio.features import rasterize as _rasterize
+            for hw_class, multiplier in ROAD_CLASS_DISCOUNTS.items():
+                if hw_class == "default":
+                    continue
+                subset = roads_utm[roads_utm["highway"] == hw_class]
+                if len(subset) == 0:
+                    continue
+                geoms = [g for g in subset.geometry if g is not None and not g.is_empty]
+                if not geoms:
+                    continue
+                class_r = _rasterize(
+                    [(g, multiplier) for g in geoms],
+                    out_shape=(rows, cols), transform=transform,
+                    fill=1.0, dtype=np.float32,
+                )
+                # Keep strongest discount (lowest value) per cell
+                np.minimum(road_layer, class_r, out=road_layer)
+        else:
+            # No class info — fall back to default discount
+            road_layer = np.where(
+                roads_mask > 0,
+                ROAD_CLASS_DISCOUNTS["default"],
+                1.0
+            ).astype(np.float32)
+
     cost = build_cost_surface(
-        slope_pct, building_mask, water_mask,
+        slope_pct, building_penalty_map, water_mask,
+        roads_mask=roads_mask,
+        roads_gdf=roads_utm,          # Phase 5.4: for per-class discount
+        lulc_penalty_map=lulc_penalty_map,
         nodata_mask=nodata_mask,
         dem=dem,
         curvature=curvature,
         resolution_m=RESOLUTION,
-        bearing_deg=bearing_deg,    # Phase 4: sidehill anisotropy
+        transform=transform,          # Phase 5.4: required for class rasterisation
     )
+
+    # ── 6b. Export intermediate rasters (optional) ────────────────────────
+    if EXPORT_INTERMEDIATES:
+        os.makedirs("output", exist_ok=True)
+        try:
+            import rasterio
+            profile = {
+                'driver': 'GTiff', 'dtype': 'float32',
+                'width': cols, 'height': rows, 'count': 1,
+                'crs': f'EPSG:{UTM_EPSG}', 'transform': transform,
+                'compress': 'deflate',
+            }
+            with rasterio.open('output/cost_surface.tif', 'w', **profile) as dst:
+                dst.write(cost.astype(np.float32), 1)
+            with rasterio.open('output/building_penalty.tif', 'w', **profile) as dst:
+                dst.write(building_penalty_map.astype(np.float32), 1)
+            log.info("Intermediate GeoTIFFs saved to output/")
+        except Exception as exc:
+            log.warning(f"Could not save intermediate GeoTIFFs: {exc}")
 
     # ── 7. Grid indices for endpoints ─────────────────────────────────────
     xa, ya = wgs84_to_utm(*POINT_A)
@@ -313,6 +427,12 @@ def main():
     )
     timer.stop()
 
+    # Guard: empty path means routing failed completely
+    if not path_indices:
+        log.error("Routing returned an empty path — cannot continue.")
+        log.error("Check that start/end points are not inside impassable zones.")
+        sys.exit(1)
+
     path_utm = [rowcol_to_xy(r, c, transform) for r, c in path_indices]
 
     # ── 9. Adaptive smoothing ──────────────────────────────────────────────
@@ -356,6 +476,98 @@ def main():
     clothoid_transitions = compute_clothoid_transitions(smooth_utm)
     infeasible_spirals = sum(1 for t in clothoid_transitions if not t["feasible"])
 
+    # ── 12b. Phase 6: Vertical alignment design (grade-clipping) ──────────
+    va_result = None
+    if EXPORT_3D_GEOJSON:
+        timer.start("12b_vertical_alignment")
+        try:
+            from vertical_alignment import build_vertical_alignment
+            k_crest, k_sag = VC_K_VALUES.get(
+                int(DESIGN_SPEED_KMPH),
+                VC_K_VALUES[min(VC_K_VALUES, key=lambda v: abs(v - DESIGN_SPEED_KMPH))]
+            )
+            g_max = GRADE_MAX_PCT.get(SCENARIO_PROFILE, 8.0)
+
+            va_result = build_vertical_alignment(
+                dists_m, elevs_m,
+                design_speed_kmph=DESIGN_SPEED_KMPH,
+                max_grade_pct=g_max,
+                k_crest=k_crest,
+                k_sag=k_sag,
+                min_vc_length_m=MIN_VC_LENGTH_M,
+                min_vpi_spacing_m=MIN_VPI_SPACING_M,
+            )
+            log.info(
+                f"Vertical alignment: {len(va_result.vertical_curves)} VCs  "
+                f"max_grade={va_result.max_grade_pct:.2f}%  "
+                f"grade_violations={len(va_result.grade_violations)}  "
+                f"SSD_violations={len(va_result.ssd_violations)}  "
+                f"max_fill={va_result.cut_fill_m.max():.1f} m  "
+                f"max_cut={-va_result.cut_fill_m.min():.1f} m"
+            )
+        except Exception as exc:
+            log.warning(f"Vertical alignment failed ({exc}) — 3D export skipped.")
+            import traceback as _tb
+            _tb.print_exc()
+        finally:
+            timer.stop()
+
+    # ── 12c. Phase 7: Earthwork volumes (cut/fill + mass-haul) ───────────
+    ew_result = None
+    if va_result is not None:
+        timer.start("12c_earthwork")
+        try:
+            from earthwork import compute_earthwork, export_earthwork_csv
+            fw = FORMATION_WIDTH_M.get(SCENARIO_PROFILE, 11.0)
+            ew_result = compute_earthwork(
+                va_result.distances_m,
+                va_result.cut_fill_m,
+                formation_width_m=fw,
+                cut_batter_HV=CUT_BATTER_HV,
+                fill_batter_HV=FILL_BATTER_HV,
+                swell_factor=SWELL_FACTOR,
+            )
+            export_earthwork_csv(ew_result, OUTPUT_EARTHWORK_CSV)
+        except Exception as exc:
+            log.warning(f"Earthwork computation failed ({exc}) — skipping.")
+            import traceback as _tb
+            _tb.print_exc()
+        finally:
+            timer.stop()
+
+    # ── 12d. Phase 8: Bridge and culvert inventory ───────────────────
+    si_result = None
+    if va_result is not None:
+        timer.start("12d_structures")
+        try:
+            from structures import build_structure_inventory, export_structures_csv
+            # flow_accum may or may not be in scope depending on whether Phase 3
+            # D8 stream derivation ran; default to None gracefully.
+            _flow_accum = locals().get("flow_accum", None)
+            si_result = build_structure_inventory(
+                smooth_utm=smooth_utm,
+                va_result=va_result,
+                water_utm=water_utm,
+                flow_accum=_flow_accum,
+                transform=transform,
+                path_indices=path_indices,
+                bridge_freeboard_m=BRIDGE_FREEBOARD_M,
+                bridge_cost_per_m2_usd=BRIDGE_COST_PER_M2_USD,
+                bridge_width_m=BRIDGE_DECK_WIDTH_M,
+                culvert_unit_cost_usd=CULVERT_UNIT_COST_USD,
+                min_culvert_accum_cells=MIN_CULVERT_ACCUM_CELLS,
+            )
+            export_structures_csv(si_result, OUTPUT_STRUCTURES_CSV)
+        except Exception as exc:
+            log.warning(f"Structure inventory failed ({exc}) — skipping.")
+            import traceback as _tb
+            _tb.print_exc()
+        finally:
+            timer.stop()
+
+    # ── 12e placeholder — cost model runs after meta is built (below) ───
+    cost_result = None
+
     # ── 13. Reproject and export ───────────────────────────────────────────
     log.info("Reprojecting to WGS-84 …")
     wgs84_coords = [utm_to_wgs84(x, y) for x, y in smooth_utm]
@@ -376,6 +588,44 @@ def main():
     # Limit to first 50 transitions to keep GeoJSON readable
     meta['clothoid_transitions']        = clothoid_transitions[:50]
 
+    # Phase 6 vertical alignment metadata
+    if va_result is not None:
+        meta['vertical_design_version']    = 'Phase6'
+        meta['vc_count']                   = len(va_result.vertical_curves)
+        meta['vertical_max_grade_pct']     = round(va_result.max_grade_pct, 2)
+        meta['vertical_grade_violations']  = len(va_result.grade_violations)
+        meta['vertical_ssd_violations']    = len(va_result.ssd_violations)
+        meta['max_fill_m']                 = round(float(va_result.cut_fill_m.max()), 1)
+        meta['max_cut_m']                  = round(float(-va_result.cut_fill_m.min()), 1)
+
+    # Phase 7 earthwork metadata
+    if ew_result is not None:
+        meta['total_cut_Mm3']       = round(ew_result.total_cut_m3  / 1e6, 3)
+        meta['total_fill_Mm3']      = round(ew_result.total_fill_m3 / 1e6, 3)
+        meta['net_import_Mm3']      = round(ew_result.net_import_m3 / 1e6, 3)
+        meta['balance_points']      = len(ew_result.balance_stations_m)
+        meta['formation_width_m']   = ew_result.formation_width_m
+
+    # Phase 8 structure metadata
+    if si_result is not None:
+        meta['bridge_count']              = si_result.bridge_count
+        meta['culvert_count']             = si_result.culvert_count
+        meta['total_bridge_length_m']     = round(si_result.total_bridge_length_m, 1)
+        meta['total_bridge_cost_USD']     = round(si_result.total_bridge_cost_usd, 0)
+        meta['total_culvert_cost_USD']    = round(si_result.total_culvert_cost_usd, 0)
+        meta['total_structure_cost_USD']  = round(si_result.total_structure_cost_usd, 0)
+
+    # Phase 9 cost model metadata
+    if cost_result is not None:
+        meta['cost_model_version']         = 'Phase9'
+        meta['total_project_cost_USD']     = round(cost_result.total_project_cost_usd, 0)
+        meta['cost_per_km_USD']            = round(cost_result.cost_per_km_usd, 0)
+        meta['civil_subtotal_USD']         = round(cost_result.civil_subtotal_usd, 0)
+        meta['contingency_USD']            = round(cost_result.contingency_usd, 0)
+        meta['engineering_USD']            = round(cost_result.engineering_usd, 0)
+        meta['land_acquisition_ha']        = round(cost_result.land_acquisition_ha, 1)
+        meta['pavement_area_m2']           = round(cost_result.pavement_area_m2, 0)
+
     # Phase 5: peak memory and stage timing
     _, peak_mem = tracemalloc.get_traced_memory()
     tracemalloc.stop()
@@ -384,6 +634,74 @@ def main():
     meta['stage_timing_s'] = timer.as_dict()
 
     export_geojson(line_wgs84, meta, OUTPUT_FILE)
+
+    # Phase 6: 3D GeoJSON export
+    if va_result is not None and EXPORT_3D_GEOJSON:
+        # Pair design elevations with WGS-84 coordinates.
+        # Both are derived from smooth_utm (same length: 500 points).
+        wgs84_coords_3d = [
+            (lon, lat, float(va_result.z_design[i]))
+            for i, (lon, lat) in enumerate(wgs84_coords)
+        ]
+        export_geojson_3d(wgs84_coords_3d, meta, OUTPUT_FILE_3D)
+
+    # ── 12e. Phase 9: Parametric cost model (runs after meta is built) ──
+    timer.start("12e_cost_model")
+    try:
+        from cost_model import compute_cost_model, export_cost_csv
+        cost_result = compute_cost_model(
+            meta=meta,
+            ew_result=ew_result,
+            si_result=si_result,
+            scenario_profile=SCENARIO_PROFILE,
+            lulc_wgs=lulc_wgs,
+            cut_rate_usd_m3=EARTHWORK_CUT_RATE_USD_M3,
+            fill_rate_usd_m3=EARTHWORK_FILL_RATE_USD_M3,
+            pavement_rate_m2=PAVEMENT_RATE_USD_M2,
+            corridor_width_m=CORRIDOR_WIDTH_M,
+            land_acq_default=LAND_ACQ_DEFAULT_USD_PER_HA,
+            land_acq_rates=LAND_ACQ_RATES,
+            env_factor=ENV_MITIGATION_FACTOR,
+            contingency_factor=CONTINGENCY_FACTOR,
+            engineering_factor=ENGINEERING_FACTOR,
+        )
+        export_cost_csv(cost_result, OUTPUT_COST_CSV)
+        # Back-patch meta with cost summary
+        meta['cost_model_version']     = 'Phase9'
+        meta['total_project_cost_USD'] = round(cost_result.total_project_cost_usd, 0)
+        meta['cost_per_km_USD']        = round(cost_result.cost_per_km_usd, 0)
+        meta['civil_subtotal_USD']     = round(cost_result.civil_subtotal_usd, 0)
+        meta['land_acquisition_ha']    = round(cost_result.land_acquisition_ha, 1)
+    except Exception as exc:
+        log.warning(f"Cost model failed ({exc}) — skipping.")
+        import traceback as _tb
+        _tb.print_exc()
+    finally:
+        timer.stop()
+
+
+    # ── 12f. Phase 10: Feasibility report ────────────────────────────────
+    timer.start("12f_report")
+    try:
+        from report import generate_report
+        generate_report(
+            meta=meta,
+            va_result=va_result,
+            ew_result=ew_result,
+            si_result=si_result,
+            cost_result=cost_result,
+            output_html=OUTPUT_REPORT_HTML,
+            output_pdf=OUTPUT_REPORT_PDF,
+        )
+    except ImportError as exc:
+        log.warning(f"Report generation skipped — {exc}")
+    except Exception as exc:
+        log.warning(f"Report generation failed ({exc}) — continuing.")
+        import traceback as _tb
+        _tb.print_exc()
+    finally:
+        timer.stop()
+
     ckpt.clear()   # successful run — remove checkpoint
 
     log.info("═" * 65)
@@ -395,16 +713,114 @@ def main():
     log.info(f"  Grade violations   : {meta['sustained_grade_violations']}")
     log.info(f"  Clothoid curves    : {meta['clothoid_curves_checked']} checked, "
              f"{meta['clothoid_infeasible']} infeasible")
+    if va_result is not None:
+        log.info(f"  Vertical curves    : {meta['vc_count']} VCs  "
+                 f"max grade={meta['vertical_max_grade_pct']}%")
+        log.info(f"  Vert grade viol.   : {meta['vertical_grade_violations']}")
+        log.info(f"  SSD violations     : {meta['vertical_ssd_violations']}")
+        log.info(f"  Max fill / cut     : +{meta['max_fill_m']} m / -{meta['max_cut_m']} m")
+        log.info(f"  3D GeoJSON         : {OUTPUT_FILE_3D}")
+    if ew_result is not None:
+        net_lbl = 'import' if ew_result.net_import_m3 > 0 else 'spoil'
+        log.info(f"  Earthwork cut      : {meta['total_cut_Mm3']} Mm³")
+        log.info(f"  Earthwork fill     : {meta['total_fill_Mm3']} Mm³")
+        log.info(f"  Net {net_lbl:<6}         : {abs(meta['net_import_Mm3']):.3f} Mm³")
+        log.info(f"  Balance points     : {meta['balance_points']}")
+        log.info(f"  Earthwork CSV      : {OUTPUT_EARTHWORK_CSV}")
+    if si_result is not None:
+        log.info(f"  Bridges            : {meta['bridge_count']} "
+                 f"({meta['total_bridge_length_m']:.0f} m span, "
+                 f"USD {meta['total_bridge_cost_USD']/1e6:.2f} M)")
+        log.info(f"  Culverts           : {meta['culvert_count']} "
+                 f"(USD {meta['total_culvert_cost_USD']/1e3:.0f} K)")
+        log.info(f"  Structure total    : USD {meta['total_structure_cost_USD']/1e6:.2f} M")
+        log.info(f"  Structures CSV     : {OUTPUT_STRUCTURES_CSV}")
     log.info(f"  Data confidence    : {meta['data_confidence']}")
     log.info(f"  DEM source         : {meta['dem_source']}")
     log.info(f"  Peak memory        : {peak_mem_mb} MB")
     log.info("═" * 65)
     timer.log_summary()
 
+    if cost_result is not None:
+        log.info(f"  Total project cost : USD {cost_result.total_project_cost_usd/1e6:.2f} M")
+        log.info(f"  Cost per km        : USD {cost_result.cost_per_km_usd/1e6:.2f} M/km")
+        log.info(f"  Pavement (m²)      : {cost_result.pavement_area_m2:,.0f} m²")
+        log.info(f"  Land acquisition   : {cost_result.land_acquisition_ha:.1f} ha")
+        log.info(f"  Cost CSV           : {OUTPUT_COST_CSV}")
+        log.info(f"  Report HTML        : {OUTPUT_REPORT_HTML}")
     if meta["data_warnings"]:
         log.warning("Data quality issues:")
         for w in meta["data_warnings"]:
             log.warning(f"  • {w}")
+
+    # ── 14. Visualization suite (Phase 5.3) ──────────────────────────────
+    if GENERATE_VISUALIZATIONS:
+        timer.start("14_visualization")
+        try:
+            from visualize_route import generate_all_visuals
+
+            # Sample slope along route_rc (raw path) — must match route_rc length
+            slope_along = np.array([
+                float(slope_pct[
+                    max(0, min(rows - 1, r)),
+                    max(0, min(cols - 1, c))
+                ])
+                for r, c in path_indices
+            ])
+
+            # Compute distances along route_rc to match slope_along length.
+            # (distances_m/elevations_m came from smooth_utm which has a
+            # different number of points — can't mix them with route_rc.)
+            rc_xs = np.array([c for _, c in path_indices], dtype=np.float64) * RESOLUTION
+            rc_ys = np.array([r for r, _ in path_indices], dtype=np.float64) * RESOLUTION
+            rc_segs = np.sqrt(np.diff(rc_xs)**2 + np.diff(rc_ys)**2)
+            rc_dists = np.concatenate(([0.0], np.cumsum(rc_segs)))
+
+            viz_data = {
+                'cost': cost,
+                'building_penalty': building_penalty_map,
+                'layers': {
+                    'slope': slope_cost_layer,
+                    'lulc': lulc_penalty_map,
+                    'water': water_layer,
+                    'building': building_penalty_map,
+                    'road': road_layer,
+                    'unified': cost,
+                },
+                'dem': dem,
+                'route_rc': path_indices,
+                'route_utm': smooth_utm,
+                'route_wgs84': wgs84_coords,
+                'distances_m': dists_m,
+                'elevations_m': elevs_m,
+                'rc_distances_m': rc_dists,      # same length as route_rc
+                'grade_violations': grade_violations,
+                'slope_along': slope_along,
+                'slope_thresholds': {
+                    's_opt': SLOPE_OPTIMAL_PCT,
+                    's_mod': SLOPE_MODERATE_PCT,
+                    's_max': SLOPE_MAX_PCT,
+                    's_cliff': SLOPE_CLIFF_PCT,
+                },
+                'meta': meta,
+                'transform': transform,
+                'resolution_m': RESOLUTION,
+                'buildings_wgs': buildings_wgs,
+                'water_wgs': water_wgs,
+                # Phase 6
+                'va_result': va_result,
+                # Phase 7
+                'ew_result': ew_result,
+                # Phase 8
+                'si_result': si_result,
+            }
+            generate_all_visuals(viz_data)
+        except Exception as exc:
+            log.warning(f"Visualization suite failed: {exc}")
+            import traceback as _tb
+            _tb.print_exc()
+        finally:
+            timer.stop()
 
 
 
