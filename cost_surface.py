@@ -529,8 +529,8 @@ def _river_hierarchy_penalties(water_mask, resolution_m):
       3: 200–500 m → major bridge        ×5 000
       4: > 500 m → Ayeyarwady-scale      ×50 000
 
-    Performance: uses ndimage.find_objects for O(1) per-component bounding box
-    instead of per-component full-array scan. ~500× faster on large grids.
+    Performance: uses EDT (distance transform) to find the true hydraulic width
+    of each connected component, ignoring its length or diagonal orientation.
     """
     tiers = WATER_PENALTY_TIERS   # list of 5 multipliers from config
     binary = (water_mask > 0).astype(np.uint8)
@@ -539,47 +539,38 @@ def _river_hierarchy_penalties(water_mask, resolution_m):
     if n_components == 0:
         return np.zeros_like(water_mask, dtype=np.float64)
 
-    # ── Vectorized: get bounding box slices for all components at once ────
-    slices = nd_label.__module__  # just to reference scipy.ndimage
-    from scipy.ndimage import find_objects
-    obj_slices = find_objects(labeled)  # list of (row_slice, col_slice) per component
+    # Calculate distance to background (0) for all water pixels
+    # The max distance inside a component is its "radius" (half-width) in pixels
+    from scipy.ndimage import distance_transform_edt, maximum
+    edt = distance_transform_edt(binary)
+    
+    # Calculate the max half-width for each component (labels 1 to n_components)
+    # The effective width is 2 * max_radius
+    max_radii_px = maximum(edt, labels=labeled, index=np.arange(1, n_components + 1))
+    
+    # max_radii_px is an array of size n_components. 
+    # If a component is just a line (1px wide), EDT is 1.0, width = 2.0 px.
+    eff_widths_m = max_radii_px * 2.0 * resolution_m
 
     # Width breakpoints in metres: <10, <50, <200, <500, ≥500
     breakpoints = np.array([10.0, 50.0, 200.0, 500.0])
 
     # Build a per-component penalty lookup: comp_penalty[comp_id] = penalty
-    # Index 0 is unused (background), indices 1..n_components are components
     comp_penalty = np.zeros(n_components + 1, dtype=np.float64)
+    
     n_tier2_plus = 0
-
-    for comp_id, sl in enumerate(obj_slices, start=1):
-        if sl is None:
-            continue
-        row_sl, col_sl = sl
-        height_px = row_sl.stop - row_sl.start
-        width_px  = col_sl.stop - col_sl.start
-
-        # Fix 2: Use area-normalised width for angled/braided rivers.
-        # Bounding-box short axis over-estimates width for diagonal channels.
-        # sqrt(area / aspect) gives a hydraulic "effective width" that is
-        # independent of orientation.
-        area_px   = int(np.sum(labeled[row_sl, col_sl] == comp_id))
-        max_ax    = max(height_px, width_px)
-        min_ax    = max(min(height_px, width_px), 1)
-        aspect    = max_ax / min_ax
-        eff_width_m = math.sqrt(area_px / aspect) * resolution_m
-
-        tier = int(np.searchsorted(breakpoints, eff_width_m))
-        comp_penalty[comp_id] = tiers[tier]
+    for comp_idx, width_m in enumerate(eff_widths_m):
+        tier = int(np.searchsorted(breakpoints, width_m))
+        comp_penalty[comp_idx + 1] = tiers[tier]
         if tier >= 2:
             n_tier2_plus += 1
 
-    # ── Single vectorized assignment: map labeled→penalty in one pass ────
+    # Single vectorised assignment: map labeled→penalty in one pass
     penalty_map = comp_penalty[labeled]
 
     log.info(
         f"River hierarchy: {n_components:,} water components classified "
-        f"({n_tier2_plus:,} at tier ≥ 2) in one vectorised pass."
+        f"({n_tier2_plus:,} at tier ≥ 2) via distance transform."
     )
     return penalty_map
 
@@ -777,7 +768,8 @@ def _apply_road_discounts(roads_gdf, roads_mask, cost, transform, shape, resolut
 
 def build_cost_surface(slope_pct, building_penalty_map, water_mask, roads_mask=None,
                        roads_gdf=None, lulc_penalty_map=None, nodata_mask=None,
-                       dem=None, curvature=None, resolution_m=30, transform=None):
+                       dem=None, curvature=None, resolution_m=30, transform=None,
+                       exclusion_gdf=None):
     """
     Assemble the full cost surface.
 
@@ -882,6 +874,13 @@ def build_cost_surface(slope_pct, building_penalty_map, water_mask, roads_mask=N
     if building_penalty_map is not None:
         cost = cost + building_penalty_map
 
+    # ── Phase 14.3: Absolute Avoidance Zones (Dams/Lakes) ─────────────────
+    if exclusion_gdf is not None:
+        log.info(f" rasterising {len(exclusion_gdf)} exclusion zones...")
+        exclusion_mask = rasterise_layer(exclusion_gdf, transform, cost.shape, value=1.0)
+        cost = np.where(exclusion_mask > 0, IMPASSABLE, cost)
+        log.info(f"Avoided {np.sum(exclusion_mask > 0):,} cells mapped as Dam/Lake exclusions.")
+
     # ── 7. NoData exclusion ───────────────────────────────────────────────
     if nodata_mask is not None:
         cost[nodata_mask] = IMPASSABLE
@@ -946,13 +945,20 @@ def build_cost_pyramid(fine_cost, levels=3, ratio=2, method="average"):
         downsampled = block_reduce(current_cost, block_size=(ratio, ratio),
                                    func=func, cval=IMPASSABLE)
 
-        # Pass B: block maximum — if ANY fine cell is IMPASSABLE, the coarse
-        # cell is impassable (you cannot route through a cliff corner).
-        # This replaces the fragile IMPASSABLE/(ratio²) threshold which was
-        # incorrectly marking 3/4-passable blocks as impassable.
-        block_max = block_reduce(current_cost, block_size=(ratio, ratio),
-                                 func=np.max, cval=IMPASSABLE)
-        downsampled[block_max >= IMPASSABLE * 0.5] = IMPASSABLE
+        # Pass B: block maximum — instead of strict block maximum (which fails
+        # narrow corridors if a single 30m cell is impassable), we count the proportion
+        # of impassable fine cells. If > 25% of the block is impassable, block the coarse cell.
+        from skimage.measure import block_reduce
+        
+        # Create binary mask of impassable fine cells
+        impassable_mask = (current_cost >= IMPASSABLE * 0.5).astype(np.float32)
+        
+        # Calculate proportion of impassable cells in each block
+        impassable_prop = block_reduce(impassable_mask, block_size=(ratio, ratio),
+                                       func=np.mean, cval=1.0) # cval=1.0 protects padded borders
+                                       
+        # Block coarse cell if > 25% is impassable
+        downsampled[impassable_prop > 0.25] = IMPASSABLE
 
         pyramid.append(downsampled)
         current_cost = downsampled

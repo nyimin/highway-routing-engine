@@ -228,7 +228,7 @@ LULC_EDGE_DECAY_M = 150  # Distance over which penalty decays to 1.0 outside pol
 # Tier 2: medium river 50–200 m → medium bridge
 # Tier 3: large river 200–500 m → major bridge (Chindwin-scale)
 # Tier 4: navigation river >500 m → Ayeyarwady-scale; find narrowest crossing
-WATER_PENALTY_TIERS = [1.5, 3.0, 5.0, 10.0, 15.0]
+WATER_PENALTY_TIERS = [5.0, 50.0, 500.0, 5000.0, 50000.0]
 
 # Bridge constraints
 MIN_BRIDGE_SPACING_M = 10_000   # Minimum distance between two major bridge sites
@@ -409,17 +409,15 @@ BRIDGE_COST_PER_M2_USD: float = 3_500.0
 # rural_trunk (2-lane): 11.0 m carriageway + 0.5 m per side = 12.0 m
 BRIDGE_DECK_WIDTH_M: float = 12.0
 
-# CULVERT TIER COSTS: Stratified cost based on flow accumulation (catchment size).
-CULVERT_PIPE_COST_USD: float = 10_000.0
-CULVERT_BOX_COST_USD: float = 25_000.0
-CULVERT_MAJOR_COST_USD: float = 75_000.0
-
-# MIN_CULVERT_ACCUM_CELLS: minimum D8 flow-accumulation cell count to trigger
-# a culvert. At RESOLUTION=30 m, each cell ~ 900 m² catchment.
-# 200 cells → ~0.18 km² catchment → warrants a culvert.
-MIN_CULVERT_ACCUM_CELLS: int = 200
-CULVERT_TIER_1_CELLS: int = 500
-CULVERT_TIER_2_CELLS: int = 2000
+# CULVERT ALLOWANCE (Parametric per-km cost instead of individual pinpointing)
+# At the preliminary stage, counting individual culverts via D8 accumulation
+# is spurious. We apply a flat allowance per km based on terrain.
+# Myanmar DRD standard allowance: USD 25,000–40,000 per km depending on terrain.
+DRAINAGE_ALLOWANCE_PER_KM_USD: dict[str, float] = {
+    "expressway":    40_000.0,
+    "rural_trunk":   30_000.0,
+    "mountain_road": 50_000.0,
+}
 
 # ── Phase 8b: Bridge Detection Filtering (Myanmar low-quality OSM context) ────
 #
@@ -487,6 +485,15 @@ WORLDCOVER_PENALTIES: dict[int, float] = {
 # If the enhanced source fetch fails, OSM is used as automatic fallback.
 USE_WORLDCOVER_LULC:    bool = True   # ESA WorldCover 10m for LULC
 USE_OVERTURE_BUILDINGS: bool = True   # Overture Maps ML building footprints
+USE_CUSTOM_WATER:       bool = True   # Custom high-fidelity Myanmar river GeoJSON
+USE_DAM_LAKE_AVOIDANCE: bool = True   # Absolute spatial avoidance of Dams/Reservoirs
+
+CUSTOM_WATER_GPKG:          str = "data/mm_river_network.gpkg"
+CUSTOM_WATER_FILTER_COLUMN: str = "F_CODE_DES"
+CUSTOM_WATER_TARGETS:       set = {"Inland Water"}
+
+DAM_LAKE_GPKG:              str = "data/mm_dam_lake.gpkg"
+DAM_LAKE_BUFFER_M:          float = 100.0
 
 # Microsoft Planetary Computer STAC API endpoint (ESA WorldCover)
 PLANETARY_COMPUTER_STAC_URL = "https://planetarycomputer.microsoft.com/api/stac/v1"

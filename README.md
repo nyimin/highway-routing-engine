@@ -5,7 +5,7 @@ It fetches elevation (DEM) and infrastructure data (OpenStreetMap), builds a
 multi-layer cost surface, runs two-resolution pathfinding, and exports
 engineering-grade GeoJSON outputs with a 10-product visualization suite.
 
-> **Current phase: 14.1** — Tang & Dou (2023) MS-LCP multi-resolution pyramid routing and Segment-Aware Terrain Adaptive Smoothing complete.
+> **Current phase: 14.3** — Segment-Aware Terrain Adaptive Smoothing, Custom Water `.gpkg` Integration, and Dam & Reservoir Absolute Avoidance complete.
 
 ---
 
@@ -20,7 +20,8 @@ engineering-grade GeoJSON outputs with a 10-product visualization suite.
 ### Cost Surface
 
 - **Slope cost** with 4-zone thresholds (optimal / moderate / max / cliff) and exponential ramp.
-- **River hierarchy** — connected-component analysis classifies water into 5 tiers (culvert → Ayeyarwady-scale) with perpendicular crossing enforcement.
+- **River hierarchy** — connected-component analysis classifies water into 5 tiers (culvert → Ayeyarwady-scale) with perpendicular crossing enforcement. Integrated custom GeoPackage datasets for high-fidelity true-width river polygons.
+- **Dam & Reservoir Avoidance** — explicit geographical buffering around sensitive water infrastructure permanently excluded with `IMPASSABLE` routing costs.
 - **Area-based building penalties** — footprint-scaled peak penalty with continuous EDT distance-decay gradient (Phase 5.2).
 - **LULC environmental multipliers** — wetland, forest, farmland, conservation areas.
 - **Road discount** — existing OSM tracks receive a 0.5× cost multiplier.

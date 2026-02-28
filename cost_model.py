@@ -9,11 +9,11 @@ Cost components
 1. Earthwork cut          — ew_result.total_cut_m3 × EARTHWORK_CUT_RATE_USD_M3
 2. Earthwork import fill  — ew_result.net_import_m3 × EARTHWORK_FILL_RATE_USD_M3
                             (only if net_import_m3 > 0; surplus spoil is free)
-3. Pavement               — formation width × length × PAVEMENT_RATE_USD_M2
+3. Pavement               — carriageway width × length × PAVEMENT_RATE_USD_M2
 4. Bridges                — si_result.total_bridge_cost_usd (already in Phase 8)
-5. Culverts               — si_result.total_culvert_cost_usd (already in Phase 8)
+5. Drainage               — parametric allowance per km based on terrain
 6. Land acquisition       — corridor area (ha) × LULC-weighted rate
-7. Environmental          — ENV_MITIGATION_FACTOR × civil subtotal (items 1–6)
+7. Environmental          — ENV_MITIGATION_FACTOR × civil subtotal (items 1-6)
 8. Contingency            — CONTINGENCY_FACTOR × civil subtotal
 9. Engineering & Admin    — ENGINEERING_FACTOR × civil subtotal
 
@@ -53,7 +53,7 @@ class CostModelResult:
     earthwork_fill_usd:     float   # USD for imported borrow fill (0 if net surplus)
     pavement_usd:           float   # USD for flexible pavement surface
     bridges_usd:            float   # USD from Phase 8 structure inventory
-    culverts_usd:           float   # USD from Phase 8 structure inventory
+    drainage_usd:           float   # Parametric allowance based on route length
     land_acquisition_usd:   float   # USD for RoW land compensation
 
     # ── Soft costs ────────────────────────────────────────────────────────
@@ -254,22 +254,28 @@ def compute_cost_model(
         f"× USD {pavement_rate_m2}/m² = USD {pavement_usd/1e6:.2f} M"
     )
 
-    # ── 4 & 5. Structures ─────────────────────────────────────────────────
+    # ── 4 & 5. Structures and Drainage ────────────────────────────────────
     if si_result is not None:
         bridges_usd  = float(si_result.total_bridge_cost_usd)
-        culverts_usd = float(si_result.total_culvert_cost_usd)
         log.info(
             f"  Bridges:        USD {bridges_usd/1e6:.2f} M  "
             f"({si_result.bridge_count} structures)"
         )
-        log.info(
-            f"  Culverts:       USD {culverts_usd/1e3:.0f} K  "
-            f"({si_result.culvert_count} structures)"
-        )
     else:
         log.warning("CostModel: si_result is None — structure costs set to 0.")
         bridges_usd  = 0.0
-        culverts_usd = 0.0
+
+    try:
+        from config import DRAINAGE_ALLOWANCE_PER_KM_USD
+        drainage_rate_per_km = DRAINAGE_ALLOWANCE_PER_KM_USD.get(scenario_profile, 30_000.0)
+    except ImportError:
+        drainage_rate_per_km = 30_000.0
+
+    drainage_usd = drainage_rate_per_km * total_length_km
+    log.info(
+        f"  Drainage:       USD {drainage_usd/1e3:.0f} K  "
+        f"({drainage_rate_per_km:,.0f} USD/km allowance)"
+    )
 
     # ── 6. Land acquisition ───────────────────────────────────────────────
     land_ha = total_length_km * 1000.0 * corridor_width_m / 10_000.0
@@ -280,10 +286,10 @@ def compute_cost_model(
         f"× USD {eff_rate:,.0f}/ha = USD {land_usd/1e6:.2f} M"
     )
 
-    # ── Civil subtotal (items 1–6) ────────────────────────────────────────
+    # ── Civil subtotal (items 1-6) ────────────────────────────────────────
     civil_subtotal = (
         ew_cut_usd + ew_fill_usd + pavement_usd +
-        bridges_usd + culverts_usd + land_usd
+        bridges_usd + drainage_usd + land_usd
     )
 
     # ── 7. Environmental mitigation ───────────────────────────────────────
@@ -326,7 +332,7 @@ def compute_cost_model(
         earthwork_fill_usd     = round(ew_fill_usd,   2),
         pavement_usd           = round(pavement_usd,  2),
         bridges_usd            = round(bridges_usd,   2),
-        culverts_usd           = round(culverts_usd,  2),
+        drainage_usd           = round(drainage_usd,  2),
         land_acquisition_usd   = round(land_usd,      2),
         environmental_usd      = round(env_usd,       2),
         civil_subtotal_usd     = round(civil_subtotal, 2),
@@ -362,7 +368,7 @@ def export_cost_csv(result: CostModelResult, output_path: str) -> None:
         ("Earthwork — Import Fill",       result.earthwork_fill_usd),
         ("Pavement (Flexible)",           result.pavement_usd),
         ("Bridges",                       result.bridges_usd),
-        ("Culverts",                      result.culverts_usd),
+        ("Drainage Allowance",            result.drainage_usd),
         ("Land Acquisition",              result.land_acquisition_usd),
         ("Environmental Mitigation",      result.environmental_usd),
         ("Contingency (20%)",             result.contingency_usd),

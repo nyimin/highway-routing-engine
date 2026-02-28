@@ -39,7 +39,7 @@ from config import (
     OUTPUT_EARTHWORK_CSV,
     # Phase 8
     BRIDGE_FREEBOARD_M, BRIDGE_COST_PER_M2_USD, BRIDGE_DECK_WIDTH_M,
-    MIN_CULVERT_ACCUM_CELLS, OUTPUT_STRUCTURES_CSV,
+    OUTPUT_STRUCTURES_CSV,
     # Phase 9
     EARTHWORK_CUT_RATE_USD_M3, EARTHWORK_FILL_RATE_USD_M3, PAVEMENT_RATE_USD_M2,
     CORRIDOR_WIDTH_M, LAND_ACQ_DEFAULT_USD_PER_HA, LAND_ACQ_RATES,
@@ -61,6 +61,7 @@ from geometry_utils import (
 from data_fetch import (
     fetch_dem, fetch_osm_layers, derive_stream_mask_utm,
     fetch_worldcover, fetch_overture_buildings, merge_building_sources,
+    fetch_custom_water, fetch_dam_lake
 )
 from cost_surface import (
     compute_slope, rasterise_layer, build_cost_surface,
@@ -247,6 +248,47 @@ def main():
     water_utm     = to_utm(water_wgs)
     roads_utm     = to_utm(roads_wgs)
     lulc_utm      = to_utm(lulc_wgs)
+
+    # ── 3c. Phase 14.2: Custom Water Dataset (supplement OSM) ─────────────
+    from config import USE_CUSTOM_WATER
+    if USE_CUSTOM_WATER:
+        custom_water_wgs = fetch_custom_water(bbox)
+        if custom_water_wgs is not None and len(custom_water_wgs) > 0:
+            custom_water_utm = to_utm(custom_water_wgs)
+            import pandas as pd
+            
+            # Add a natural="water" tag so it passes filter_bridge_worthy_water
+            if "natural" not in custom_water_utm.columns:
+                custom_water_utm["natural"] = "water"
+            else:
+                custom_water_utm["natural"] = custom_water_utm["natural"].fillna("water")
+                
+            if water_utm is None or len(water_utm) == 0:
+                water_utm = custom_water_utm
+            else:
+                water_utm = pd.concat([water_utm, custom_water_utm], ignore_index=True)
+            log.info(f"Custom water merged: total water features now {len(water_utm)}.")
+        else:
+            log.info("Custom water: none fetched — using OSM only.")
+
+    # ── 3d. Phase 14.3: Dam & Lake Avoidance Zones ──────────────────────────
+    from config import USE_DAM_LAKE_AVOIDANCE, DAM_LAKE_BUFFER_M
+    exclusion_gdf_utm = None
+    if USE_DAM_LAKE_AVOIDANCE:
+        dam_lake_wgs = fetch_dam_lake(bbox)
+        if dam_lake_wgs is not None and len(dam_lake_wgs) > 0:
+            dam_lake_utm = to_utm(dam_lake_wgs)
+            
+            # Apply geometric buffer for structural avoidance
+            if DAM_LAKE_BUFFER_M > 0:
+                # Store original for export or visuals if needed, buffer the active geometry
+                dam_lake_utm["geometry"] = dam_lake_utm.geometry.buffer(DAM_LAKE_BUFFER_M)
+                log.info(f"Dam/Lake: Buffered exclusion zones by {DAM_LAKE_BUFFER_M} m.")
+            
+            exclusion_gdf_utm = dam_lake_utm
+            log.info(f"Dam/Lake: Registered {len(exclusion_gdf_utm)} strictly avoided geometries.")
+        else:
+            log.info("Dam/Lake: none fetched — no absolute avoidance zones registered.")
 
     # Harmonize: Pre-filter water polygons to only bridge-worthy rivers
     # so the routing engine and the structure detector see the exact same rivers.
@@ -445,6 +487,7 @@ def main():
         curvature=curvature,
         resolution_m=RESOLUTION,
         transform=transform,          # Phase 5.4: required for class rasterisation
+        exclusion_gdf=exclusion_gdf_utm # Phase 14.3: Dam/Lake avoidance
     )
 
     # ── 6b. Export intermediate rasters (optional) ────────────────────────
@@ -650,13 +693,14 @@ def main():
                 smooth_utm=smooth_utm,
                 va_result=va_result,
                 water_utm=water_utm,
+                water_mask=water_mask,
                 flow_accum=_flow_accum,
                 transform=transform,
                 path_indices=path_indices,
                 bridge_freeboard_m=BRIDGE_FREEBOARD_M,
                 bridge_cost_per_m2_usd=BRIDGE_COST_PER_M2_USD,
                 bridge_width_m=BRIDGE_DECK_WIDTH_M,
-                min_culvert_accum_cells=MIN_CULVERT_ACCUM_CELLS,
+                resolution_m=RESOLUTION,
             )
             export_structures_csv(si_result, OUTPUT_STRUCTURES_CSV)
         except Exception as exc:
@@ -710,11 +754,8 @@ def main():
     # Phase 8 structure metadata
     if si_result is not None:
         meta['bridge_count']              = si_result.bridge_count
-        meta['culvert_count']             = si_result.culvert_count
         meta['total_bridge_length_m']     = round(si_result.total_bridge_length_m, 1)
         meta['total_bridge_cost_USD']     = round(si_result.total_bridge_cost_usd, 0)
-        meta['total_culvert_cost_USD']    = round(si_result.total_culvert_cost_usd, 0)
-        meta['total_structure_cost_USD']  = round(si_result.total_structure_cost_usd, 0)
 
     # ── 12e. Phase 9: Parametric cost model ─────────────────────────────────
     # Fix 19: Moved to before export_geojson so cost_result fields appear in
@@ -830,9 +871,6 @@ def main():
         log.info(f"  Bridges            : {meta['bridge_count']} "
                  f"({meta['total_bridge_length_m']:.0f} m span, "
                  f"USD {meta['total_bridge_cost_USD']/1e6:.2f} M)")
-        log.info(f"  Culverts           : {meta['culvert_count']} "
-                 f"(USD {meta['total_culvert_cost_USD']/1e3:.0f} K)")
-        log.info(f"  Structure total    : USD {meta['total_structure_cost_USD']/1e6:.2f} M")
         log.info(f"  Structures CSV     : {OUTPUT_STRUCTURES_CSV}")
     log.info(f"  Data confidence    : {meta['data_confidence']}")
     log.info(f"  DEM source         : {meta['dem_source']}")

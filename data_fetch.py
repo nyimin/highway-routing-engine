@@ -863,3 +863,72 @@ def merge_building_sources(osm_buildings, overture_buildings, dedup_radius_m=15.
         f"({n_dedup} duplicates removed) = {len(merged)} total"
     )
     return merged
+
+
+# ── Phase 14.2: Custom Water Dataset ──────────────────────────────────────────
+
+def fetch_custom_water(bbox_wgs84):
+    """
+    Fetch and clip custom water polygons from a local GeoPackage file.
+    Returns a GeoDataFrame in WGS-84 CRS, or an empty GeoDataFrame if disabled/failed.
+    """
+    from config import USE_CUSTOM_WATER, CUSTOM_WATER_GPKG, CUSTOM_WATER_FILTER_COLUMN, CUSTOM_WATER_TARGETS
+    if not USE_CUSTOM_WATER:
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    if not os.path.exists(CUSTOM_WATER_GPKG):
+        log.warning(f"Custom water GeoPackage not found at {CUSTOM_WATER_GPKG}. Falling back to OSM only.")
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+
+    try:
+        log.info(f"Loading custom water data from {CUSTOM_WATER_GPKG} ...")
+        gdf = gpd.read_file(CUSTOM_WATER_GPKG)
+        
+        # Filter features based on targets
+        if CUSTOM_WATER_FILTER_COLUMN and CUSTOM_WATER_FILTER_COLUMN in gdf.columns:
+            filtered_gdf = gdf[gdf[CUSTOM_WATER_FILTER_COLUMN].isin(CUSTOM_WATER_TARGETS)].copy()
+            log.info(f"Filtered {len(gdf)} down to {len(filtered_gdf)} features matching {CUSTOM_WATER_TARGETS}.")
+        else:
+            filtered_gdf = gdf.copy()
+
+        # Clip to bounding box
+        west, south, east, north = [float(v) for v in bbox_wgs84]
+        clipped = gpd.clip(filtered_gdf, box(west, south, east, north))
+        
+        log.info(f"Custom water: {len(clipped)} features retained after clipping to bounding box.")
+        return clipped.reset_index(drop=True)
+
+    except Exception as exc:
+        log.warning(f"Failed to load/clip custom water dataset ({exc}). Falling back to OSM only.")
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        
+
+def fetch_dam_lake(bbox_wgs84):
+    """
+    Fetch and clip Dam & Lake polygons from a local GeoPackage file.
+    These are used as absolute NO-GO avoidance zones.
+    Returns a GeoDataFrame in WGS-84 CRS.
+    """
+    from config import USE_DAM_LAKE_AVOIDANCE, DAM_LAKE_GPKG
+    if not USE_DAM_LAKE_AVOIDANCE:
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        
+    if not os.path.exists(DAM_LAKE_GPKG):
+        log.warning(f"Dam/Lake GeoPackage not found at {DAM_LAKE_GPKG}. Dam avoidance skipped.")
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        
+    try:
+        log.info(f"Loading Dam & Lake avoidance zones from {DAM_LAKE_GPKG} ...")
+        gdf = gpd.read_file(DAM_LAKE_GPKG)
+        
+        # Clip to bounding box
+        west, south, east, north = [float(v) for v in bbox_wgs84]
+        clipped = gpd.clip(gdf, box(west, south, east, north))
+        
+        log.info(f"Dam/Lake: {len(clipped)} features retained strictly for avoidance after clipping.")
+        return clipped.reset_index(drop=True)
+        
+    except Exception as exc:
+        log.warning(f"Failed to load/clip Dam & Lake dataset ({exc}). Avoidance skipped.")
+        return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+

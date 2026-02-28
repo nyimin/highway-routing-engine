@@ -322,11 +322,6 @@
         <div class="value">{{ bridge_count }}</div>
         <div class="unit">structures</div>
       </div>
-      <div class="metric-card">
-        <div class="label">Culverts</div>
-        <div class="value">{{ culvert_count }}</div>
-        <div class="unit">structures</div>
-      </div>
     </div>
 
     <table>
@@ -387,11 +382,6 @@
           <td>Bridge Structures</td>
           <td>{{ bridge_count }}</td>
           <td>Total span: {{ "%.0f"|format(total_bridge_len_m) }} m</td>
-        </tr>
-        <tr>
-          <td>Culvert Structures</td>
-          <td>{{ culvert_count }}</td>
-          <td>D8 drainage siting</td>
         </tr>
       </tbody>
     </table>
@@ -614,9 +604,8 @@
 
     {% if si_available %}
     <p>
-      {{ bridge_count }} bridge(s) and {{ culvert_count }} culvert(s) were
-      identified along the alignment using Shapely water polygon intersection
-      and D8 flow accumulation.
+      {{ bridge_count }} bridge(s) were identified along the alignment using
+      Shapely water polygon intersection.
     </p>
 
     {% if structures %}
@@ -655,9 +644,9 @@
       </tbody>
       <tfoot>
         <tr>
-          <td colspan="6">TOTAL STRUCTURE COST</td>
+          <td colspan="6">TOTAL BRIDGE COST</td>
           <td class="right mono">
-            {{ "{:,.0f}".format(total_structure_cost_usd) }}
+            {{ "{:,.0f}".format(total_bridge_cost_usd) }}
           </td>
         </tr>
       </tfoot>
@@ -731,10 +720,10 @@
           </td>
         </tr>
         <tr>
-          <td>Culverts (Phase 8 inventory)</td>
-          <td class="right mono">{{ "{:,.0f}".format(cost.culverts_usd) }}</td>
+          <td>Drainage Allowance</td>
+          <td class="right mono">{{ "{:,.0f}".format(cost.drainage_usd) }}</td>
           <td class="right">
-            {{ "%.1f"|format(100*cost.culverts_usd/total) }}%
+            {{ "%.1f"|format(100*cost.drainage_usd/total) }}%
           </td>
         </tr>
         <tr>

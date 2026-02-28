@@ -145,9 +145,8 @@ def generate_report(
     # ── Structure variables ───────────────────────────────────────────────
     si_available = si_result is not None
     bridge_count          = si_result.bridge_count   if si_available else 0
-    culvert_count         = si_result.culvert_count  if si_available else 0
     total_bridge_len_m    = si_result.total_bridge_length_m  if si_available else 0.0
-    total_structure_usd   = si_result.total_structure_cost_usd if si_available else 0.0
+    total_bridge_usd      = si_result.total_bridge_cost_usd if si_available else 0.0
     structures            = si_result.structures if si_available else []
 
     # ── Cost variables ────────────────────────────────────────────────────
@@ -195,9 +194,8 @@ def generate_report(
         # Structures
         si_available      = si_available,
         bridge_count      = bridge_count,
-        culvert_count     = culvert_count,
         total_bridge_len_m = total_bridge_len_m,
-        total_structure_cost_usd = total_structure_usd,
+        total_bridge_cost_usd = total_bridge_usd,
         structures        = structures,
         # Cost
         cost_available    = cost_available,

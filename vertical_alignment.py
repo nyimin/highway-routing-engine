@@ -361,25 +361,41 @@ def _fit_vertical_curves(vpi_stations: np.ndarray,
 
     log.info(f"Vertical alignment: {len(curves)} parabolic vertical curves fitted")
 
-    # Fix 11: Sequential overlap detection.
+    # Fix 11: Sequential overlap detection with safety limits.
     # If PVC[i+1] falls inside the previous curve [PVC[i]..PVT[i]], both curves
     # overlap — the FGL formula produces incorrect elevations in the overlap zone.
-    # Resolution: proportionally shorten both curves so they just touch at the
-    # midpoint between their two VPIs.
+    # Resolution: shorten both curves so they just touch at the midpoint 
+    # between their two VPIs, but enforce absolute minimum AASHTO lengths
+    # to avoid creating unsafe hidden dips or sharp crests.
     for j in range(len(curves) - 1):
         c1, c2 = curves[j], curves[j + 1]
+        
+        # We need the AASHTO minimum safe lengths for both curves
+        min_safe_L1 = max(c1.k_required * abs(c1.g2_pct - c1.g1_pct), min_vc_length_m)
+        min_safe_L2 = max(c2.k_required * abs(c2.g2_pct - c2.g1_pct), min_vc_length_m)
+
         if c2.pvc_station_m < c1.pvt_station_m:
             # Overlap detected: available room between the two VPIs
             mid = (c1.pvi_station_m + c2.pvi_station_m) / 2.0
-            # Shorten c1 so its PVT = mid
-            new_L1 = max((mid - c1.pvi_station_m) * 2.0, min_vc_length_m)
-            # Shorten c2 so its PVC = mid
-            new_L2 = max((c2.pvi_station_m - mid) * 2.0, min_vc_length_m)
+            
+            # Shorten c1 and c2 towards mid, but clamp at absolute minimum safety lengths
+            new_L1 = max((mid - c1.pvi_station_m) * 2.0, min_safe_L1)
+            new_L2 = max((c2.pvi_station_m - mid) * 2.0, min_safe_L2)
+            
+            # If enforcing minimum safety length causes overlap again, this is a 
+            # geometric impossibility to resolve without moving VPIs. We log a design exception.
+            new_c1_pvt = c1.pvi_station_m + new_L1 / 2.0
+            new_c2_pvc = c2.pvi_station_m - new_L2 / 2.0
+            
+            overlap_status = ""
+            if new_c2_pvc < new_c1_pvt:
+                overlap_status = " (Unresolvable Geometric Overlap - DESIGN EXCEPTION)"
+
             log.warning(
                 f"Vertical curve overlap: VC@{c1.pvi_station_m:.0f} m and "
                 f"VC@{c2.pvi_station_m:.0f} m overlap by "
                 f"{c1.pvt_station_m - c2.pvc_station_m:.0f} m. "
-                f"Curves shortened to L={new_L1:.0f} m and {new_L2:.0f} m."
+                f"Curves shortened to L={new_L1:.0f} m and {new_L2:.0f} m{overlap_status}."
             )
             # Re-derive PVC/PVT and z_pvc from updated lengths
             curves[j] = VerticalCurve(

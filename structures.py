@@ -54,10 +54,10 @@ class Structure:
     structure_id: int
     structure_type: str          # 'bridge' or 'culvert'
     chainage_m: float            # mid-point chainage along alignment
-    chainage_start_m: float      # start of structure (bridges only, else = chainage)
-    chainage_end_m: float        # end of structure (bridges only, else = chainage)
+    chainage_start_m: float      # start of structure
+    chainage_end_m: float        # end of structure
     length_m: float              # span/crossing length (m)
-    deck_elevation_m: float      # design deck elevation (m above MSL); 0 for culverts
+    deck_elevation_m: float      # design deck elevation (m above MSL)
     freeboard_m: float           # headroom above HWL (bridges only)
     estimated_cost_usd: float    # preliminary cost estimate
     water_name: str              # OSM name if available, else 'unnamed'
@@ -71,10 +71,8 @@ class StructureInventory:
     structures: list[Structure]
     total_bridge_length_m: float
     total_bridge_cost_usd: float
-    total_culvert_cost_usd: float
-    total_structure_cost_usd: float
+    total_bridge_cost_usd: float
     bridge_count: int
-    culvert_count: int
 
 
 # ── Step 0: Filter water features to bridge-worthy subset ─────────────────────
@@ -161,13 +159,12 @@ def filter_bridge_worthy_water(water_utm):
 
 # ── Step 0b: Crossing angle validation ────────────────────────────────────────
 
-def _validate_crossing(route_ls, seg, water_geom):
+def _validate_crossing(route_ls, seg, water_geom, mid_pt, local_width_m=None):
     """
     Validate if a crossing is a true transverse crossing rather than
     the route skimming the bank or running longitudinally inside the river.
     
-    Instead of unreliable bounding box angles, this uses the ratio between
-    the crossing span (seg.length) and the local river width.
+    Uses ratio between crossing span (seg.length) and local river width if available.
     If span > 3 * local_width, it's a longitudinal run, not a crossing.
 
     Returns (is_valid, local_width, span_length)
@@ -179,48 +176,50 @@ def _validate_crossing(route_ls, seg, water_geom):
     # Find the midpoint of the route segment inside the water
     mid_pt = seg.interpolate(0.5, normalized=True)
     
-    # Calculate route direction vector at midpoint
-    eps = min(5.0, span_len / 4.0)
-    try:
-        mid_s = route_ls.project(mid_pt)
-        p1 = route_ls.interpolate(max(0.0, mid_s - eps))
-        p2 = route_ls.interpolate(min(route_ls.length, mid_s + eps))
-        dr = p2.x - p1.x
-        dc = p2.y - p1.y
-        norm = math.hypot(dr, dc)
-        if norm < 1e-6:
-            # Fallback
+    # If we already have a raster-derived local width, use it
+    if local_width_m is not None and local_width_m > 0:
+        local_width = local_width_m
+    else:
+        # Calculate route direction vector at midpoint
+        eps = min(5.0, span_len / 4.0)
+        try:
+            mid_s = route_ls.project(mid_pt)
+            p1 = route_ls.interpolate(max(0.0, mid_s - eps))
+            p2 = route_ls.interpolate(min(route_ls.length, mid_s + eps))
+            dr = p2.x - p1.x
+            dc = p2.y - p1.y
+            norm = math.hypot(dr, dc)
+            if norm < 1e-6:
+                return True, span_len, span_len
+                
+            dx, dy = dr/norm, dc/norm
+            
+            # Perpendicular vector to measure river width
+            px, py = -dy, dx
+            
+            # Measure local river width by throwing a transect line across the midpoint
+            from shapely.geometry import LineString
+            t_start = (mid_pt.x - px * 1000.0, mid_pt.y - py * 1000.0)
+            t_end   = (mid_pt.x + px * 1000.0, mid_pt.y + py * 1000.0)
+            transect = LineString([t_start, t_end])
+            
+            width_inter = transect.intersection(water_geom)
+            local_width = width_inter.length if not width_inter.is_empty else span_len
+            
+        except Exception as e:
+            log.debug(f"Structures: crossing validation exception: {e}")
             return True, span_len, span_len
-            
-        dx, dy = dr/norm, dc/norm
+
+    # If the route span is more than 3x the local width, it's running parallel/longitudinally
+    if span_len > max(local_width * 3.0, 50.0):
+        return False, local_width, span_len
         
-        # Perpendicular vector to measure river width
-        px, py = -dy, dx
-        
-        # Measure local river width by throwing a transect line across the midpoint
-        # 2000m total transect (1000m each side) should cover Ayeyarwady
-        from shapely.geometry import LineString
-        t_start = (mid_pt.x - px * 1000.0, mid_pt.y - py * 1000.0)
-        t_end   = (mid_pt.x + px * 1000.0, mid_pt.y + py * 1000.0)
-        transect = LineString([t_start, t_end])
-        
-        width_inter = transect.intersection(water_geom)
-        local_width = width_inter.length if not width_inter.is_empty else span_len
-        
-        # If the route span is more than 3x the local width, it's running parallel/longitudinally
-        if span_len > max(local_width * 3.0, 50.0):
-            return False, local_width, span_len
-            
-        return True, local_width, span_len
-        
-    except Exception as e:
-        log.debug(f"Structures: crossing validation exception: {e}")
-        return True, span_len, span_len
+    return True, local_width, span_len
 
 
 # ── Step 1: Find water crossings using route–water intersection ───────────────
 
-def _find_water_crossings(smooth_utm, water_utm, va_result):
+def _find_water_crossings(smooth_utm, water_utm, va_result, water_mask=None, transform=None, resolution_m=30.0):
     """
     Intersect the alignment LineString with bridge-worthy water body polygons.
 
@@ -260,10 +259,33 @@ def _find_water_crossings(smooth_utm, water_utm, va_result):
     route_ls = SLine([(x, y) for x, y in smooth_utm])
     route_len = route_ls.length
 
+    # Optional: Calculate distance transform on water mask for robust width detection
+    edt_width_m = None
+    if water_mask is not None and transform is not None:
+        try:
+            from scipy.ndimage import distance_transform_edt
+            binary = (water_mask > 0).astype(np.uint8)
+            edt = distance_transform_edt(binary)
+            edt_width_m = edt * 2.0 * resolution_m
+            log.info("Structures: Computed raster-based hydraulic width map for crossings.")
+        except Exception as e:
+            log.warning(f"Structures: Failed to compute water distance transform: {e}")
+
     # Helper: chainage of a point on the route (projected distance)
     def pt_to_chainage(pt):
         frac = route_ls.project(pt) / route_len
         return float(frac * va_result.distances_m[-1])
+
+    def pt_to_width(pt):
+        """Sample the EDT width raster at a given coordinate."""
+        if edt_width_m is None or transform is None:
+            return None
+        col, row = ~transform * (pt.x, pt.y)
+        col, row = int(col), int(row)
+        if 0 <= row < edt_width_m.shape[0] and 0 <= col < edt_width_m.shape[1]:
+            val = edt_width_m[row, col]
+            return float(val) if val > 0 else None
+        return None
 
     crossings = []
     for _, row in water_utm.iterrows():
@@ -295,8 +317,11 @@ def _find_water_crossings(smooth_utm, water_utm, va_result):
             if seg.length < 1.0:
                 continue
 
+            mid_pt = seg.interpolate(0.5, normalized=True)
+            local_width_m = pt_to_width(mid_pt)
+
             # Phase 8b: crossing validation (replaces angle check)
-            is_valid, local_width, span = _validate_crossing(route_ls, seg, geom)
+            is_valid, local_width, span = _validate_crossing(route_ls, seg, geom, mid_pt, local_width_m=local_width_m)
             if not is_valid:
                 log.debug(
                     f"Structures: rejected crossing (span {span:.1f}m > 3x width {local_width:.1f}m "
@@ -311,13 +336,19 @@ def _find_water_crossings(smooth_utm, water_utm, va_result):
             if s_end < s_start:
                 s_start, s_end = s_end, s_start
             span = s_end - s_start
-            if span < 5.0:  # Ignore tiny clips on the edge
+            
+            # Use raster width if it's much larger than intersecting span (e.g. LineStrings buffered to 10m)
+            reported_span = span
+            if local_width_m is not None and local_width_m > min(span * 1.5, span + 10.0):
+                reported_span = local_width_m
+
+            if reported_span < 5.0:  # Ignore tiny clips on the edge
                 continue
             crossings.append({
                 "start_m":    s_start,
                 "end_m":      s_end,
                 "mid_m":      (s_start + s_end) / 2.0,
-                "length_m":   span,
+                "length_m":   reported_span,
                 "water_name": str(row.get("name", "unnamed")) if hasattr(row, "get") else "unnamed",
             })
 
@@ -328,7 +359,8 @@ def _find_water_crossings(smooth_utm, water_utm, va_result):
         if merged and c["start_m"] - merged[-1]["end_m"] < 50.0:
             prev = merged[-1]
             prev["end_m"]    = max(prev["end_m"], c["end_m"])
-            prev["length_m"] = prev["end_m"] - prev["start_m"]
+            # Preserve raster-derived widths if they were larger
+            prev["length_m"] = max(prev["length_m"], c["length_m"], prev["end_m"] - prev["start_m"])
             prev["mid_m"]    = (prev["start_m"] + prev["end_m"]) / 2.0
             if prev["water_name"] == "unnamed":
                 prev["water_name"] = c["water_name"]
@@ -475,14 +507,14 @@ def export_structures_csv(inventory: StructureInventory, output_path: str) -> No
     with open(output_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
-            "id", "type", "chainage_m",
+            "id", "chainage_m",
             "chainage_start_m", "chainage_end_m",
             "length_m", "deck_elev_m", "freeboard_m",
             "cost_usd", "water_name", "lon", "lat",
         ])
         for s in inventory.structures:
             writer.writerow([
-                s.structure_id, s.structure_type,
+                s.structure_id,
                 round(s.chainage_m, 1),
                 round(s.chainage_start_m, 1),
                 round(s.chainage_end_m, 1),
@@ -503,16 +535,17 @@ def build_structure_inventory(
     smooth_utm,
     va_result,
     water_utm,
-    flow_accum,
-    transform,
-    path_indices,
+    water_mask=None,
+    flow_accum=None,
+    transform=None,
+    path_indices=None,
     bridge_freeboard_m: float     = 1.5,
     bridge_cost_per_m2_usd: float = 3_500.0,
     bridge_width_m: float         = 12.0,
-    min_culvert_accum_cells: int  = 200,
+    resolution_m: float           = 30.0,
 ) -> StructureInventory:
     """
-    Detect bridges and culverts along the 3D alignment and estimate costs.
+    Detect bridges along the 3D alignment and estimate costs.
 
     Parameters
     ----------
@@ -536,9 +569,6 @@ def build_structure_inventory(
     bridge_width_m : float
         Assumed bridge deck width (m) = carriageway + parapets.
         For rural_trunk 2-lane: 11 m + 1 m parapets = 12 m.
-    min_culvert_accum_cells : int
-        Minimum upstream cells for culvert siting. Cells × RESOLUTION² ≈ drainage
-        area. Default 200 → at 30 m resolution ≈ 0.18 km² catchment.
 
     Returns
     -------
@@ -546,21 +576,15 @@ def build_structure_inventory(
     """
     # Fetch config parameters inside the function to avoid circular imports during testing
     try:
-        from config import (
-            BRIDGE_BANK_SETBACK_M, 
-            CULVERT_PIPE_COST_USD, CULVERT_BOX_COST_USD, CULVERT_MAJOR_COST_USD,
-            CULVERT_TIER_1_CELLS, CULVERT_TIER_2_CELLS
-        )
+        from config import BRIDGE_BANK_SETBACK_M 
     except ImportError:
         BRIDGE_BANK_SETBACK_M = 15.0
-        CULVERT_PIPE_COST_USD = 10_000.0
-        CULVERT_BOX_COST_USD = 25_000.0
-        CULVERT_MAJOR_COST_USD = 75_000.0
-        CULVERT_TIER_1_CELLS = 500
-        CULVERT_TIER_2_CELLS = 2000
 
     # Step 1 — bridges
-    crossings = _find_water_crossings(smooth_utm, water_utm, va_result)
+    crossings = _find_water_crossings(
+        smooth_utm, water_utm, va_result,
+        water_mask=water_mask, transform=transform, resolution_m=resolution_m
+    )
 
     structures: list[Structure] = []
     # Fix 13: Store [start_m, end_m] ranges instead of only midpoints so that
@@ -623,76 +647,22 @@ def build_structure_inventory(
         bridge_chainages_set.add(mid_s)
         bridge_ranges.append((cr["start_m"], cr["end_m"]))
 
-    bridge_cnt = len(structures) - sum(1 for s in structures if s.structure_type == "culvert")
-
-    # Step 2 — culverts
-    # Fix 13: Pass bridge ranges to culvert finder so suppression covers full spans
-    culvert_sites = _find_culvert_sites(
-        va_result, flow_accum, transform, path_indices,
-        bridge_chainages=bridge_chainages_set,
-        bridge_ranges=bridge_ranges,
-        min_accum_cells=min_culvert_accum_cells,
-    )
-
-    for j, site in enumerate(culvert_sites):
-        s        = site["chainage_m"]
-        lon, lat = _utm_chainage_to_wgs84(s, smooth_utm, va_result)
-        
-        # Stratify culvert costs based on catchment size
-        accum = site["flow_accum_cells"]
-        if accum < CULVERT_TIER_1_CELLS:
-            culvert_cost = CULVERT_PIPE_COST_USD
-        elif accum < CULVERT_TIER_2_CELLS:
-            culvert_cost = CULVERT_BOX_COST_USD
-        else:
-            culvert_cost = CULVERT_MAJOR_COST_USD
-            
-        # Fix 14: Compute culvert barrel length from formation geometry.
-        # Barrel length = formation_width + 2 × fill_batter_HV × fill_height.
-        # A 1.5 m fill height floor applies where the road is near grade.
-        try:
-            from config import FORMATION_WIDTH_M, FILL_BATTER_HV, SCENARIO_PROFILE
-            _fw       = FORMATION_WIDTH_M.get(SCENARIO_PROFILE, 11.0)
-            _z_des    = float(_z_at(s, va_result))
-            _hl       = max(_z_des, 1.5)   # elevation above datum as proxy for fill height; floor 1.5 m
-            barrel_len = round(_fw + 2.0 * FILL_BATTER_HV * _hl, 1)
-        except Exception:
-            barrel_len = 15.5  # conservative default for rural_trunk
-
-        structures.append(Structure(
-            structure_id      = bridge_cnt + j + 1,
-            structure_type    = "culvert",
-            chainage_m        = s,
-            chainage_start_m  = s,
-            chainage_end_m    = s,
-            length_m          = barrel_len,
-            deck_elevation_m  = _z_at(s, va_result),
-            freeboard_m       = 0.0,
-            estimated_cost_usd= culvert_cost,
-            water_name        = "drainage",
-            lon               = lon,
-            lat               = lat,
-        ))
+    bridge_cnt = len(structures)
 
     structures.sort(key=lambda s: s.chainage_m)
 
     total_bridge_len  = sum(s.length_m for s in structures if s.structure_type == "bridge")
     total_bridge_cost = sum(s.estimated_cost_usd for s in structures if s.structure_type == "bridge")
-    total_culv_cost   = sum(s.estimated_cost_usd for s in structures if s.structure_type == "culvert")
 
     log.info(
         f"Structure inventory: "
         f"{bridge_cnt} bridge(s) ({total_bridge_len:.0f} m total span, "
-        f"USD {total_bridge_cost/1e6:.2f} M)  "
-        f"{len(culvert_sites)} culvert(s) (USD {total_culv_cost/1e3:.0f} K)"
+        f"USD {total_bridge_cost/1e6:.2f} M)"
     )
 
     return StructureInventory(
         structures             = structures,
         total_bridge_length_m  = total_bridge_len,
         total_bridge_cost_usd  = total_bridge_cost,
-        total_culvert_cost_usd = total_culv_cost,
-        total_structure_cost_usd = total_bridge_cost + total_culv_cost,
         bridge_count           = bridge_cnt,
-        culvert_count          = len(culvert_sites),
     )

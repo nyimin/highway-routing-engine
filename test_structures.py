@@ -165,7 +165,7 @@ def test_close_crossings_merge():
     water1 = Polygon([(2000, -50), (2100, -50), (2100, 50), (2000, 50)])
     water2 = Polygon([(2110, -50), (2190, -50), (2190, 50), (2110, 50)])
     water_gdf = gpd.GeoDataFrame(
-        {"geometry": [water1, water2], "name": ["r1", "r2"]},
+        {"geometry": [water1, water2], "name": ["r1", "r2"], "waterway": ["river", "river"]},
         crs="EPSG:32647"
     )
 
@@ -204,7 +204,6 @@ def test_structure_sorting():
         bridge_freeboard_m=1.5,
         bridge_cost_per_m2_usd=3500.0,
         bridge_width_m=12.0,
-        min_culvert_accum_cells=100,
     )
 
     chainages = [s.chainage_m for s in inventory.structures]
@@ -299,7 +298,7 @@ def test_linestring_not_bridged():
     stream = LineString([(5000, -200), (5000, 200)])
     water_gdf = gpd.GeoDataFrame(
         {"geometry": [stream], "name": ["test_stream"],
-         "natural": [None], "waterway": ["stream"]},
+         "natural": [None], "waterway": ["river"]},
         crs="EPSG:32647"
     )
 
@@ -332,7 +331,7 @@ def test_real_river_bridged():
     river = Polygon([(5000, -200), (5100, -200), (5100, 200), (5000, 200)])
     water_gdf = gpd.GeoDataFrame(
         {"geometry": [river], "name": ["test_river"],
-         "natural": ["water"], "waterway": [None]},
+         "natural": ["water"], "water": ["river"], "waterway": [None]},
         crs="EPSG:32647"
     )
 
