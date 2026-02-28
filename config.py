@@ -349,15 +349,24 @@ OUTPUT_FILE_3D: str = "preliminary_route_3d.geojson"
 
 # ── Phase 7: Earthwork Volumes ────────────────────────────────────────────────
 #
-# FORMATION_WIDTH_M: total subgrade width in metres = carriageway + both shoulders.
+# FORMATION_WIDTH_M: total subgrade width (carriageway + both shoulders).
+# CARRIAGEWAY_WIDTH_M: trafficable surface only — used for pavement billing.
 # Myanmar DRD typical sections:
-#   rural_trunk  (2-lane): 7.0 m carriageway + 2×2.0 m shoulders = 11.0 m
-#   expressway   (4-lane): 2×(3.65 m×2 lanes) + 2×3.0 m shoulders = 20.6 m → use 24 m
+#   rural_trunk  (2-lane): 7.0 m carriageway + 2×2.0 m shoulders = 11.0 m total
+#   expressway   (4-lane): 14.6 m carriageway + 2×3.0 m shoulders = 20.6 m → use 24 m
 #   mountain_road (1.5-lane): 6.0 m carriageway + 2×1.0 m shoulders = 8.0 m
 FORMATION_WIDTH_M: dict[str, float] = {
     "expressway":    24.0,
     "rural_trunk":   11.0,
     "mountain_road":  8.0,
+}
+
+# Carriageway-only width for pavement cost billing (no shoulders).
+# Source: Myanmar DRD Standard Cross-Sections 2019.
+CARRIAGEWAY_WIDTH_M: dict[str, float] = {
+    "expressway":    14.6,   # 4 lanes × 3.65 m
+    "rural_trunk":    7.0,   # 2 lanes × 3.5 m
+    "mountain_road":  6.0,   # 2 narrow lanes × 3.0 m
 }
 
 # Cut batter slopes (H:V) by material class.
@@ -438,6 +447,10 @@ BRIDGE_EXCLUDE_NATURAL_TAGS: set = {"wetland"}
 # Minimum water polygon area (m²) to warrant a bridge.
 # At 30 m resolution, a single cell ≈ 900 m²; 500 m² catches sub-cell ponds.
 BRIDGE_MIN_WATER_AREA_M2: float = 500.0
+
+# Minimum hydraulic span (m) — water features narrower than this are culverts,
+# not bridges.  Imported explicitly so structures.py never needs a fallback.
+BRIDGE_MIN_SPAN_M: float = 10.0
 
 # Minimum crossing angle (degrees) between route and water body longest axis.
 # Prevents false bridges from route running parallel inside a river polygon.

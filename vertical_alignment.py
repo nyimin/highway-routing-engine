@@ -146,6 +146,11 @@ def _detect_vpi_candidates(distances_m: np.ndarray,
 
     g_fine = terrain_interp(s_fine, 1) * 100.0   # grade in %
 
+    # Fix 10: Increase prominence from 0.5 → 2.0 %.
+    # At 0.5% a 30 m DEM with ~0.3 m vertical noise creates hundreds of
+    # spurious VPIs from noise spikes.  2.0% matches the typical noise floor
+    # of COP30/SRTM and produces a manageable VPI density (roughly 1 per 300 m
+    # of real terrain change for rural_trunk standard).
     peak_idx,   _ = find_peaks( g_fine, prominence=peak_prominence)
     trough_idx, _ = find_peaks(-g_fine, prominence=peak_prominence)
 
@@ -259,8 +264,10 @@ def _clip_grades(vpi_stations: np.ndarray,
             continue
         g_back = (z[i + 1] - z[i]) / ds
         if g_back > g_max:
-            # z[i+1] is well above z[i]; raise z[i] to bring grade back to limit
-            z[i] = z[i + 1] - g_max * ds
+            # z[i+1] is well above z[i]; raise z[i] to bring grade back to limit.
+            # Fix 9: floor to terrain so the backward clip never drops below ground.
+            z_adj = z[i + 1] - g_max * ds
+            z[i] = max(z_adj, z_terrain_at_vpi[i])
         elif g_back < -g_max:
             # z[i+1] is well below z[i]; lower z[i] to meet limit
             z_clipped = z[i + 1] + g_max * ds
@@ -353,6 +360,53 @@ def _fit_vertical_curves(vpi_stations: np.ndarray,
         ))
 
     log.info(f"Vertical alignment: {len(curves)} parabolic vertical curves fitted")
+
+    # Fix 11: Sequential overlap detection.
+    # If PVC[i+1] falls inside the previous curve [PVC[i]..PVT[i]], both curves
+    # overlap — the FGL formula produces incorrect elevations in the overlap zone.
+    # Resolution: proportionally shorten both curves so they just touch at the
+    # midpoint between their two VPIs.
+    for j in range(len(curves) - 1):
+        c1, c2 = curves[j], curves[j + 1]
+        if c2.pvc_station_m < c1.pvt_station_m:
+            # Overlap detected: available room between the two VPIs
+            mid = (c1.pvi_station_m + c2.pvi_station_m) / 2.0
+            # Shorten c1 so its PVT = mid
+            new_L1 = max((mid - c1.pvi_station_m) * 2.0, min_vc_length_m)
+            # Shorten c2 so its PVC = mid
+            new_L2 = max((c2.pvi_station_m - mid) * 2.0, min_vc_length_m)
+            log.warning(
+                f"Vertical curve overlap: VC@{c1.pvi_station_m:.0f} m and "
+                f"VC@{c2.pvi_station_m:.0f} m overlap by "
+                f"{c1.pvt_station_m - c2.pvc_station_m:.0f} m. "
+                f"Curves shortened to L={new_L1:.0f} m and {new_L2:.0f} m."
+            )
+            # Re-derive PVC/PVT and z_pvc from updated lengths
+            curves[j] = VerticalCurve(
+                pvc_station_m=c1.pvi_station_m - new_L1 / 2.0,
+                pvi_station_m=c1.pvi_station_m,
+                pvt_station_m=c1.pvi_station_m + new_L1 / 2.0,
+                g1_pct=c1.g1_pct,
+                g2_pct=c1.g2_pct,
+                length_m=new_L1,
+                k_value=new_L1 / abs(c1.g2_pct - c1.g1_pct) if abs(c1.g2_pct - c1.g1_pct) > 1e-9 else float('inf'),
+                k_required=c1.k_required,
+                curve_type=c1.curve_type,
+                z_pvc=c1.z_pvc,
+            )
+            curves[j + 1] = VerticalCurve(
+                pvc_station_m=c2.pvi_station_m - new_L2 / 2.0,
+                pvi_station_m=c2.pvi_station_m,
+                pvt_station_m=c2.pvi_station_m + new_L2 / 2.0,
+                g1_pct=c2.g1_pct,
+                g2_pct=c2.g2_pct,
+                length_m=new_L2,
+                k_value=new_L2 / abs(c2.g2_pct - c2.g1_pct) if abs(c2.g2_pct - c2.g1_pct) > 1e-9 else float('inf'),
+                k_required=c2.k_required,
+                curve_type=c2.curve_type,
+                z_pvc=c2.z_pvc,
+            )
+
     return curves
 
 
@@ -499,7 +553,7 @@ def build_vertical_alignment(
     k_sag: Optional[int] = None,
     min_vc_length_m: float = 30.0,
     min_vpi_spacing_m: float = 200.0,
-    peak_prominence: float = 0.5,
+    peak_prominence: float = 2.0,   # Fix 10: was 0.5; raised to suppress DEM-noise VPIs
 ) -> VerticalAlignmentResult:
     """
     Build a vertical alignment profile over the given terrain.

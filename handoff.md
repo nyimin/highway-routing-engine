@@ -1,4 +1,4 @@
-# Highway Alignment Generator — Handoff Document (Phase 14 Complete)
+# Highway Alignment Generator — Handoff Document (Phase 14.1 Complete)
 
 ## Current State
 
@@ -7,31 +7,32 @@ buildings, 10 K+ river components) and produces a **276 km alignment** with zero
 curve-radius or grade violations. Exit code 0, peak memory ~2.9 GB on 8 GB RAM.
 
 **Phases 6–14 have been added**, implementing a full 3D vertical design profile,
-earthwork volumetrics, a bridge/culvert structure inventory, a parametric cost model, automated feasibility reports, minimum design lengths constraints, earthwork proxy awareness, continuous multi-bridge routing, and the Tang & Dou (2023) MS-LCP progressive routing algorithm.
+earthwork volumetrics, a bridge/culvert structure inventory, a parametric cost model, automated feasibility reports, minimum design lengths constraints, earthwork proxy awareness, continuous multi-bridge routing, the Tang & Dou (2023) MS-LCP progressive routing algorithm, and terrain-adaptive geometric smoothing.
 
 ---
 
 ## Phase History
 
-| Phase  | Scope                                                                                        |
-| ------ | -------------------------------------------------------------------------------------------- |
-| 1–2    | DEM fetch (OpenTopography fallback chain), basic slope cost, OSM buildings/water             |
-| 3      | D8 flow-accumulation stream fallback when OSM water is sparse                                |
-| 4      | Two-resolution coarse-to-fine routing, corridor band masking, FMM/Dijkstra engine            |
-| 5.0    | Numba JIT (`try_jit`), vectorised flow-accumulation, `tracemalloc`, auto `COARSE_FACTOR`     |
-| 5.1    | LULC environmental multipliers, road discount, 5-tier river hierarchy with bridge siting     |
-| 5.2    | Area-based building penalties with EDT distance-decay, chunked rasterization                 |
-| 5.3    | Routing polish, 12-product visualization suite, stability audit                              |
-| 5.4    | Class-based road discounts, expanded LULC table (18 categories), OSM data mitigations        |
-| **6**  | **Vertical alignment — grade-clipping FGL, parabolic VCs, 3D GeoJSON export**                |
-| **7**  | **Earthwork volumes — trapezoidal AEA, Brückner mass-haul, CSV export**                      |
-| **8**  | **Bridge & culvert inventory — geometric crossing detection, D8 culvert siting**             |
-| **9**  | **Parametric Cost Model — aggregate all cost components into USD breakdown**                 |
-| **10** | **Automated Feasibility Report — Jinja2 HTML → PDF (with WeasyPrint)**                       |
-| **11** | **Earthwork Proxy — route pathfinding accounts for local terrain relief volumes**            |
-| **12** | **Design Validations — enforces minimum geometric lengths for curves and tangents**          |
-| **13** | **Multi-Bridge Support — continuous pathfinding sequences through N identified bridges**     |
-| **14** | **MS-LCP Optimization — Tang & Dou (2023) progressive pyramid & parallel segmented routing** |
+| Phase    | Scope                                                                                        |
+| -------- | -------------------------------------------------------------------------------------------- |
+| 1–2      | DEM fetch (OpenTopography fallback chain), basic slope cost, OSM buildings/water             |
+| 3        | D8 flow-accumulation stream fallback when OSM water is sparse                                |
+| 4        | Two-resolution coarse-to-fine routing, corridor band masking, FMM/Dijkstra engine            |
+| 5.0      | Numba JIT (`try_jit`), vectorised flow-accumulation, `tracemalloc`, auto `COARSE_FACTOR`     |
+| 5.1      | LULC environmental multipliers, road discount, 5-tier river hierarchy with bridge siting     |
+| 5.2      | Area-based building penalties with EDT distance-decay, chunked rasterization                 |
+| 5.3      | Routing polish, 12-product visualization suite, stability audit                              |
+| 5.4      | Class-based road discounts, expanded LULC table (18 categories), OSM data mitigations        |
+| **6**    | **Vertical alignment — grade-clipping FGL, parabolic VCs, 3D GeoJSON export**                |
+| **7**    | **Earthwork volumes — trapezoidal AEA, Brückner mass-haul, CSV export**                      |
+| **8**    | **Bridge & culvert inventory — geometric crossing detection, D8 culvert siting**             |
+| **9**    | **Parametric Cost Model — aggregate all cost components into USD breakdown**                 |
+| **10**   | **Automated Feasibility Report — Jinja2 HTML → PDF (with WeasyPrint)**                       |
+| **11**   | **Earthwork Proxy — route pathfinding accounts for local terrain relief volumes**            |
+| **12**   | **Design Validations — enforces minimum geometric lengths for curves and tangents**          |
+| **13**   | **Multi-Bridge Support — continuous pathfinding sequences through N identified bridges**     |
+| **14**   | **MS-LCP Optimization — Tang & Dou (2023) progressive pyramid & parallel segmented routing** |
+| **14.1** | **Geometric Refinement — Segment-aware weighted B-splines for terrain-adaptive smoothing**   |
 
 ---
 
@@ -238,7 +239,7 @@ OUTPUT_COST_CSV             = "output/cost_estimate.csv"
 
 ---
 
-## Smoke-Test Baseline (Phase 14)
+## Smoke-Test Baseline (Phase 14.1)
 
 | Metric             | Value                          |
 | ------------------ | ------------------------------ |

@@ -5,7 +5,7 @@ It fetches elevation (DEM) and infrastructure data (OpenStreetMap), builds a
 multi-layer cost surface, runs two-resolution pathfinding, and exports
 engineering-grade GeoJSON outputs with a 10-product visualization suite.
 
-> **Current phase: 14** — Tang & Dou (2023) Multi-Scale Least-Cost Path (MS-LCP) multi-resolution pyramid routing complete.
+> **Current phase: 14.1** — Tang & Dou (2023) MS-LCP multi-resolution pyramid routing and Segment-Aware Terrain Adaptive Smoothing complete.
 
 ---
 
@@ -36,7 +36,7 @@ engineering-grade GeoJSON outputs with a 10-product visualization suite.
 
 ### Geometry & Vertical Alignment (Phase 6)
 
-- **B-spline smoothing** with clothoid transition analysis.
+- **Segment-aware weighted B-spline smoothing** dynamically adjusts curvature radius based on local terrain capabilities with clothoid transition analysis.
 - **Curve-radius verification** against design-speed minimums (e.g., 150 m at 60 km/h).
 - **Finished Grade Line (FGL)** vertical alignment with parabolic curves.
 - **Sustained-grade verification** and AASHTO stopping sight distance checks.

@@ -1,0 +1,80 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.5, pytest-9.0.2, pluggy-1.5.0
+rootdir: D:\Triune\Stack Space - Documents\Code\Infra_Proj
+plugins: anyio-4.12.0, logfire-4.21.0
+collected 10 items
+
+test_structures.py .....F..F.                                            [100%]
+
+================================== FAILURES ===================================
+___________________________ test_structure_sorting ____________________________
+
+    def test_structure_sorting():
+        """
+        After build_structure_inventory with no water but culverts, the
+        structures list must be sorted by chainage_m ascending.
+        """
+        n  = 100
+        d  = np.linspace(0, 10000, n)
+        # Multiple valleys
+        z  = 100.0 + 5.0 * np.sin(2 * np.pi * d / 3000)
+        va = _MockVA(distances_m=d, z_design=z, cut_fill_m=np.zeros(n))
+    
+        fa = np.full((100, 100), 500, dtype=np.int32)
+        path_indices = [(i, i % 100) for i in range(100)]
+        smooth_utm   = [(float(i * 100), 0.0) for i in range(100)]
+    
+>       inventory = build_structure_inventory(
+            smooth_utm=smooth_utm,
+            va_result=va,
+            water_utm=None,
+            flow_accum=fa,
+            transform=None,
+            path_indices=path_indices,
+            bridge_freeboard_m=1.5,
+            bridge_cost_per_m2_usd=3500.0,
+            bridge_width_m=12.0,
+            culvert_unit_cost_usd=15000.0,
+            min_culvert_accum_cells=100,
+        )
+E       TypeError: build_structure_inventory() got an unexpected keyword argument 'culvert_unit_cost_usd'
+
+test_structures.py:197: TypeError
+_________________________ test_linestring_not_bridged _________________________
+
+    def test_linestring_not_bridged():
+        """
+        A LineString waterway (stream centreline) should produce 0 bridges.
+        LineStrings don't represent water surface area.
+        """
+        try:
+            import geopandas as gpd
+            from shapely.geometry import LineString
+        except ImportError:
+            print("  \u26a0 test_linestring_not_bridged: shapely/geopandas not available \u2014 skipped")
+            return
+    
+        route = [(float(x), 0.0) for x in range(0, 10001, 100)]
+        va    = _make_va(n=len(route), length=10000.0)
+    
+        # A stream LineString that crosses the route
+        stream = LineString([(5000, -200), (5000, 200)])
+        water_gdf = gpd.GeoDataFrame(
+            {"geometry": [stream], "name": ["test_stream"],
+             "natural": [None], "waterway": ["stream"]},
+            crs="EPSG:32647"
+        )
+    
+        crossings = _find_water_crossings(route, water_gdf, va)
+>       assert len(crossings) == 0, (
+            f"LineString stream should NOT produce a bridge, got {len(crossings)} crossings"
+        )
+E       AssertionError: LineString stream should NOT produce a bridge, got 1 crossings
+E       assert 1 == 0
+E        +  where 1 = len([{'end_m': 5004.999999999999, 'length_m': 9.99999999999909, 'mid_m': 5000.0, 'start_m': 4995.0, ...}])
+
+test_structures.py:308: AssertionError
+=========================== short test summary info ===========================
+FAILED test_structures.py::test_structure_sorting - TypeError: build_structur...
+FAILED test_structures.py::test_linestring_not_bridged - AssertionError: Line...
+========================= 2 failed, 8 passed in 1.91s =========================

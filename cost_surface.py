@@ -89,26 +89,26 @@ def compute_earthwork_proxy(dem, slope_pct, resolution_m, weight=0.30, floodplai
         relief = np.where(floodplain_mask, relief + FLOODPLAIN_MIN_FILL_M, relief)
 
     # ── Step 2: approximate cross-section volume per metre of road ────────
-    # For a relief of h metres:
-    #   cut volume  ≈ ½ × h × (fw + h × cut_batter) per metre of road
-    #   fill volume ≈ ½ × h × (fw + h × fill_batter) per metre of road
-    # Average batter
+    # AASHTO trapezoidal cross-section:
+    #   A_cut  = h × (fw + h × cut_batter_HV)   [batter_HV covers BOTH sides]
+    #   A_fill = h × (fw + h × fill_batter_HV)
+    # The previous 0.5 factor was incorrect: it halved the trapezoidal area,
+    # producing volumes ~50 % below the correct earthwork quantity.
     avg_batter = (CUT_BATTER_HV + FILL_BATTER_HV) / 2.0
-    volume_per_m = 0.5 * relief * (fw + relief * avg_batter)
+    volume_per_m = relief * (fw + relief * avg_batter)
 
     # ── Step 3: slope-grade interaction ───────────────────────────────────
     # If terrain slope exceeds max design grade, extra earthwork is needed
     # to bring the grade down to the design limit.
     grade_excess = np.maximum(slope_pct / 100.0 - max_g, 0.0)  # fraction
     # Extra volume from grade reduction: proportional to excess × pixel length
-    grade_volume = grade_excess * resolution_m * fw * 0.5
+    grade_volume = grade_excess * resolution_m * fw
     volume_per_m += grade_volume
 
     # ── Step 4: normalize to multiplier ───────────────────────────────────
     # Typical Myanmar rural cut: 500–2000 m³/km = 0.5–2.0 m³/m
-    # We want volume_per_m of ~2 m³/m to produce a multiplier of ~2.0
-    # Scale: 1.0 + weight × volume_per_m / reference_volume
-    ref_volume = fw * 0.5  # half-formation width as reference
+    # Reference volume = full trapezoid at 1 m relief → fw + batter
+    ref_volume = fw + avg_batter  # m³/m at 1 m relief
     multiplier = 1.0 + weight * np.clip(volume_per_m / max(ref_volume, 1.0), 0.0, 5.0)
 
     n_penalised = int(np.sum(multiplier > 1.1))
@@ -128,7 +128,7 @@ def compute_slope(dem, resolution_m):
     curvature: second derivative (positive = convex hill, negative = concave valley).
     """
     dem_work = dem.copy().astype(np.float32)
-    nodata_mask = (dem_work <= DEM_NODATA_SENTINEL + 1)   # sentinel ± tolerance
+    nodata_mask = (dem_work <= DEM_NODATA_SENTINEL + 100)  # +100 catches bilinear edge-blended sentinels
 
     # Fill nodata by nearest-valid-neighbor before gradient computation
     if nodata_mask.any():
@@ -182,10 +182,17 @@ def _slope_cost_array(slope_pct):
     t3 = (slope_pct[m3] - s_mod) / max(s_max - s_mod, 0.01)
     cost[m3] = 10.0 * np.exp(t3 * math.log(20.0))
 
-    # Zone 4 — near-cliff (200 → ~4000; tunnelling/major cut required)
+    # Zone 4 — near-cliff (200 → hard cap at 0.1 × IMPASSABLE)
+    # Previously reached ~4 000 at s_cliff creating a ~250 000× jump
+    # to IMPASSABLE one pixel later.  The cap ensures a smooth,
+    # monotone cost approach to the impassable boundary so the router
+    # can hug the cliff foot rather than stalling on the cost spike.
     m4 = (slope_pct > s_max) & (slope_pct < s_cliff)
     t4 = (slope_pct[m4] - s_max) / max(s_cliff - s_max, 0.01)
-    cost[m4] = 200.0 * np.exp(t4 * math.log(20.0))
+    cost[m4] = np.minimum(
+        200.0 * np.exp(t4 * math.log(20.0)),
+        IMPASSABLE * 0.1,   # hard cap: never exceed 10 % of IMPASSABLE
+    )
 
     # Zone 5 — cliff
     cost[slope_pct >= s_cliff] = IMPASSABLE
@@ -335,6 +342,9 @@ def worldcover_to_lulc_raster(wc_array, wc_transform, target_shape,
     penalty_10m = np.full((rows_wc, cols_wc), LULC_UNMAPPED_BASE, dtype=np.float32)
     for class_val, mult in WORLDCOVER_PENALTIES.items():
         penalty_10m[wc_array == class_val] = mult
+    # Fix V: class 0 is ocean/NoData fill in WorldCover — assign neutral value
+    # to avoid artificial 1.15× penalty seeping into coastal/edge cells.
+    penalty_10m[wc_array == 0] = 1.0
 
     # Step 2: resample 10m → target grid (30m) using bilinear
     dst_crs = rasterio.crs.CRS.from_epsg(UTM_EPSG)
@@ -547,10 +557,19 @@ def _river_hierarchy_penalties(water_mask, resolution_m):
             continue
         row_sl, col_sl = sl
         height_px = row_sl.stop - row_sl.start
-        width_px = col_sl.stop - col_sl.start
-        short_axis_m = min(height_px, width_px) * resolution_m
+        width_px  = col_sl.stop - col_sl.start
 
-        tier = int(np.searchsorted(breakpoints, short_axis_m))
+        # Fix 2: Use area-normalised width for angled/braided rivers.
+        # Bounding-box short axis over-estimates width for diagonal channels.
+        # sqrt(area / aspect) gives a hydraulic "effective width" that is
+        # independent of orientation.
+        area_px   = int(np.sum(labeled[row_sl, col_sl] == comp_id))
+        max_ax    = max(height_px, width_px)
+        min_ax    = max(min(height_px, width_px), 1)
+        aspect    = max_ax / min_ax
+        eff_width_m = math.sqrt(area_px / aspect) * resolution_m
+
+        tier = int(np.searchsorted(breakpoints, eff_width_m))
         comp_penalty[comp_id] = tiers[tier]
         if tier >= 2:
             n_tier2_plus += 1
@@ -686,8 +705,11 @@ def _apply_road_discounts(roads_gdf, roads_mask, cost, transform, shape, resolut
     class_discount[on_road] = ROAD_CLASS_DISCOUNTS["default"]
 
     if roads_gdf is not None and len(roads_gdf) > 0 and "highway" in roads_gdf.columns:
-        # Build a per-class raster by rasterising each highway value separately.
-        # Use the lowest multiplier where polygons overlap.
+        # Fix VII: Rewritten discount accumulation.
+        # Old code added (~on_road).astype(float) to class_raster which could
+        # overwrite a previously applied better (lower) discount with 1.0.
+        # New: rasterise each highway class; apply np.minimum ONLY to road
+        # pixels actually covered by that class's geometries.
         for hw_class, multiplier in ROAD_CLASS_DISCOUNTS.items():
             if hw_class == "default":
                 continue
@@ -701,12 +723,17 @@ def _apply_road_discounts(roads_gdf, roads_mask, cost, transform, shape, resolut
                 [(g, multiplier) for g in geoms],
                 out_shape=shape,
                 transform=transform,
-                fill=1.0,   # non-road background = no discount
+                fill=1.0,   # non-road background = no discount (1.0 = neutral)
                 dtype=np.float32,
             )
-            # np.minimum keeps the strongest discount (lowest multiplier)
-            np.minimum(class_discount, class_raster + (~on_road).astype(np.float32),
-                       out=class_discount)
+            # Only update class_discount where this class actually burned a road
+            # cell (class_raster < 1.0).  Other cells are untouched, preserving
+            # any stronger (lower) discount previously written by another class.
+            burned_here = (class_raster < 1.0) & on_road
+            class_discount[burned_here] = np.minimum(
+                class_discount[burned_here],
+                class_raster[burned_here],
+            )
         log.info(
             f"Road discounts: per-class multipliers applied to {on_road.sum():,} "
             f"centreline cells  (classes: "
@@ -905,29 +932,37 @@ def build_cost_pyramid(fine_cost, levels=3, ratio=2, method="average"):
         # Pad dimensions to be a multiple of ratio before downsampling
         pad_rows = (ratio - (current_cost.shape[0] % ratio)) % ratio
         pad_cols = (ratio - (current_cost.shape[1] % ratio)) % ratio
-        
+
         if pad_rows > 0 or pad_cols > 0:
             current_cost = np.pad(
-                current_cost, 
-                ((0, pad_rows), (0, pad_cols)), 
-                mode='constant', 
+                current_cost,
+                ((0, pad_rows), (0, pad_cols)),
+                mode='constant',
                 constant_values=IMPASSABLE
             )
-            
-        downsampled = block_reduce(current_cost, block_size=(ratio, ratio), func=func, cval=IMPASSABLE)
-        
-        # Ensure extremely high costs (e.g. averaged IMPASSABLE) remain clamped to IMPASSABLE
-        downsampled[downsampled >= (IMPASSABLE / (ratio**2))] = IMPASSABLE
-        
+
+        # Fix 4: Two-pass aggregation for correct IMPASSABLE propagation.
+        # Pass A: average (or max) of all fine cells — reflects terrain cost.
+        downsampled = block_reduce(current_cost, block_size=(ratio, ratio),
+                                   func=func, cval=IMPASSABLE)
+
+        # Pass B: block maximum — if ANY fine cell is IMPASSABLE, the coarse
+        # cell is impassable (you cannot route through a cliff corner).
+        # This replaces the fragile IMPASSABLE/(ratio²) threshold which was
+        # incorrectly marking 3/4-passable blocks as impassable.
+        block_max = block_reduce(current_cost, block_size=(ratio, ratio),
+                                 func=np.max, cval=IMPASSABLE)
+        downsampled[block_max >= IMPASSABLE * 0.5] = IMPASSABLE
+
         pyramid.append(downsampled)
         current_cost = downsampled
-        
+
         valid_cells = downsampled[downsampled < IMPASSABLE]
         max_cost = valid_cells.max() if len(valid_cells) > 0 else 0
         log.info(
             f"Pyramid Level {lvl} (1:{ratio**lvl}): shape={downsampled.shape}, "
             f"max_valid_cost={max_cost:.1f}"
         )
-        
+
     return pyramid
 

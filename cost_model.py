@@ -236,10 +236,21 @@ def compute_cost_model(
         ew_fill_usd = 0.0
 
     # ── 3. Pavement ───────────────────────────────────────────────────────
-    pavement_area_m2 = total_length_km * 1000.0 * formation_width_m
+    # Fix 20: Bill pavement on CARRIAGEWAY width only (AC + granular base applies
+    # to the paved travel lanes, NOT to the compacted-earth/gravel shoulders).
+    # Using formation_width_m here was overbilling by ~57% for rural_trunk
+    # (11 m formation vs 7 m carriageway).
+    try:
+        from config import CARRIAGEWAY_WIDTH_M as _CW
+        carriageway_width_m = _CW.get(scenario_profile, formation_width_m * 0.64)
+    except Exception:
+        carriageway_width_m = formation_width_m * 0.64   # conservative fallback
+
+    pavement_area_m2 = total_length_km * 1000.0 * carriageway_width_m
     pavement_usd     = pavement_area_m2 * pavement_rate_m2
     log.info(
         f"  Pavement:       {pavement_area_m2/1e6:.3f} km² "
+        f"(carriageway {carriageway_width_m:.1f} m, formation {formation_width_m:.1f} m) "
         f"× USD {pavement_rate_m2}/m² = USD {pavement_usd/1e6:.2f} M"
     )
 

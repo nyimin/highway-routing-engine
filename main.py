@@ -296,8 +296,15 @@ def main():
     log.info("Rasterising roads_mask...")
     roads_mask    = rasterise_layer(roads_utm,     transform, (rows, cols))
     
-    # ── 5b. Phase 11: LULC source selection (WorldCover vs OSM) ──────────
-    lulc_penalty_map = np.ones((rows, cols), dtype=np.float32)
+    # ── 5b. Phase 11: LULC source selection (WorldCover + OSM blend) ──────
+    # Fix IX: WorldCover is satellite-derived (wall-to-wall vegetation class)
+    # but does NOT encode legal barriers (protected areas, national parks).
+    # OSM polygons DO capture government-designated legal zones with high accuracy.
+    # Strategy: compute both, take element-wise maximum — WorldCover for terrain
+    # cost, OSM for legal penalty uplift.  Falls back gracefully if either fails.
+    from cost_surface import _apply_lulc_penalties
+
+    lulc_penalty_map = np.full((rows, cols), 1.0, dtype=np.float32)
     lulc_source = "none"
 
     if USE_WORLDCOVER_LULC:
@@ -313,21 +320,32 @@ def main():
             lulc_source = "WorldCover 10m"
             log.info("LULC source: ESA WorldCover 10m (satellite-derived, wall-to-wall)")
         else:
-            log.warning("WorldCover fetch failed — falling back to OSM LULC.")
+            log.warning("WorldCover fetch failed — falling back to OSM LULC only.")
 
-    if lulc_source == "none":
-        # Fallback: use OSM LULC polygons (legacy path)
-        if lulc_utm is not None and len(lulc_utm) > 0:
-            log.info("Applying LULC penalties from OSM (slope interaction + EDT decay) ...")
-            from cost_surface import _apply_lulc_penalties
-            lulc_penalty_map = _apply_lulc_penalties(
-                lulc_utm, transform, (rows, cols), slope_pct=slope_pct
-            )
+    # Always blend OSM LULC on top (maximum).  Even when WorldCover succeeds,
+    # OSM-mapped protected areas / national parks carry legal penalty information
+    # that WorldCover cannot encode.  np.maximum preserves the higher penalty
+    # from either source at each cell.
+    if lulc_utm is not None and len(lulc_utm) > 0:
+        log.info("Blending OSM LULC polygons (protected areas / legal barriers) …")
+        osm_penalty_map = _apply_lulc_penalties(
+            lulc_utm, transform, (rows, cols), slope_pct=slope_pct
+        )
+        # Blend: take the worse (higher) penalty at each cell
+        np.maximum(lulc_penalty_map, osm_penalty_map, out=lulc_penalty_map)
+        if lulc_source == "none":
             lulc_source = "OSM polygons"
         else:
-            lulc_source = "none (unmapped base only)"
+            lulc_source = "WorldCover 10m + OSM blended"
+        log.info(
+            f"LULC blend complete: max penalty={lulc_penalty_map.max():.1f}×, "
+            f"cells above 1.0: {np.sum(lulc_penalty_map > 1.0):,}"
+        )
+    elif lulc_source == "none":
+        lulc_source = "none (unmapped base 1.0)"
 
     log.info(f"LULC penalty source: {lulc_source}")
+
 
     # Phase 3: if OSM water is sparse, derive stream network from DEM
     if osm_stats.get('dem_stream_fallback'):
@@ -339,84 +357,21 @@ def main():
         log.info(f"Combined water mask: {n_stream_cells:,} cells "
                  f"(OSM={osm_stats['water']} + DEM-derived)")
                  
-        # Vectorize dem_streams so structures.py can detect crossings
-        # Instead of rasterio.features.shapes on full pixels (which makes 30m wide polygons),
-        # we extract centerlines so routing/intersection handles them as 1D features.
-        from skimage.morphology import skeletonize
-        import geopandas as gpd
-        
-        # 1. Skeletonize the mask to get 1-pixel wide lines
-        stream_mask_bool = dem_streams > 0
-        skeleton = skeletonize(stream_mask_bool)
-        
-        # 2. Extract coordinates of the skeleton cells
-        # This is a naive line-builder. Instead of complex graph tracing, 
-        # we can just use rasterio.features.shapes on the skeleton, 
-        # which will yield Polygon outlines of the 1-pixel line. 
-        # Or better yet, since structures.py buffers LineStrings anyway:
+        # Fix 17: Removed dead-code duplicate vectorisation loop.
+        # Only the polygon-based approach (below) successfully appends to dem_water_gdf.
         from rasterio.features import shapes
         from shapely.geometry import shape
-        
-        skeleton_int = skeleton.astype(np.int32)
-        vectors = []
-        for geom, val in shapes(skeleton_int, mask=skeleton_int > 0, transform=transform):
-            poly = shape(geom)
-            # A 1-px wide polygon from shapes() looks like a staircase. 
-            # We can just extract the boundary or simplify it heavily to act like a line.
-            # Convert to LineString via boundary to avoid internal area checks 
-            # firing false positive intersection spans.
-            # But the simplest is to just keep it as a very thin polygon 
-            # and let structures.py buffer/intersect it.
-            vectors.append(poly)
-            
-        if vectors:
-            dem_water_gdf = gpd.GeoDataFrame(
-                {"waterway": ["stream"] * len(vectors)}, 
-                geometry=vectors, 
-                crs=f"EPSG:{UTM_EPSG}"
-            )
-            # We will rely on structures.py logic: it converts Polygons to boundary
-            # if they are too thin, or simply intersects. With skeletonize, the width is 1 pixel (30m).
-            # To fix the "30m wide" issue, we MUST use LineStrings here.
-            import networkx as nx
-            from itertools import combinations
-            
-            # Simple approach to get Point clouds of the skeleton and connect them 
-            # is complex. Alternatively, just shrink the polygons to lines.
-            
-            lines = []
-            for v in vectors:
-                # The boundary of a 1px shape is a ring.
-                # A medial axis / centerline is better.
-                pass
-                
-        # Better approach for LineStrings: 
-        # Extract pixel coordinates and connect nearest neighbors
-        y_idx, x_idx = np.where(skeleton)
-        lines = []
-        if len(y_idx) > 0:
-            # We will just use the skeletonized Polygons but simplify them aggressively 
-            # to collapse the "staircase" width.
-            pass
-            
-        # Let's use the simplest, most robust method: 
-        # Centerline extraction using shapely.
-        # Create polygons from the shapes, then get their centerlines.
+        import geopandas as gpd
+
         vectors = []
         for geom, val in shapes((dem_streams > 0).astype(np.int32), mask=(dem_streams > 0), transform=transform):
             poly = shape(geom)
-            # Create a rough centerline by simplifying the polygon heavily, 
-            # or just rely on the bounding box center. 
-            # Since these are streams, they can be long.
-            # Instead of perfect lines, we can just leave them as Polygons BUT 
-            # tag them so structures.py knows they are DEM streams and treats them 
-            # completely differently (e.g. constant 10m width).
             vectors.append(poly)
-            
+
         if vectors:
             dem_water_gdf = gpd.GeoDataFrame(
-                {"waterway": ["dem_stream"] * len(vectors)}, # Tag as dem_stream
-                geometry=vectors, 
+                {"waterway": ["dem_stream"] * len(vectors)},
+                geometry=vectors,
                 crs=f"EPSG:{UTM_EPSG}"
             )
             if water_utm is None or len(water_utm) == 0:
@@ -535,10 +490,18 @@ def main():
                 f"Relaxing local 3×3 neighbourhood to cost=1."
             )
             r, c = rc
-            cost[
-                max(0, r - 1):min(rows, r + 2),
-                max(0, c - 1):min(cols, c + 2),
-            ] = 1.0
+            # Fix 18: Replace hard-coded cost=1.0 with neighbourhood-minimum floor.
+            # Setting cost = 1.0 made the entire 3×3 zone free, allowing Dijkstra to
+            # route a cost-free detour through the endpoint rather than finding the
+            # least-cost entry. Instead, use the 5th-percentile of valid neighbour costs
+            # so the endpoint is passable but no cheaper than the surrounding terrain.
+            r0, r1 = max(0, r - 1), min(rows, r + 2)
+            c0, c1 = max(0, c - 1), min(cols, c + 2)
+            neighbourhood = cost[r0:r1, c0:c1].copy()
+            valid_costs = neighbourhood[neighbourhood < IMPASSABLE]
+            floor_cost = float(np.percentile(valid_costs, 5)) if len(valid_costs) > 0 else 1.0
+            floor_cost = max(floor_cost, 1.0)
+            cost[r0:r1, c0:c1] = np.minimum(cost[r0:r1, c0:c1], floor_cost)
 
     # ── 8. Multi-Scale LCP routing (Tang & Dou 2023) ─────────────────────────
     # Generate the multi-resolution pyramid
@@ -753,7 +716,39 @@ def main():
         meta['total_culvert_cost_USD']    = round(si_result.total_culvert_cost_usd, 0)
         meta['total_structure_cost_USD']  = round(si_result.total_structure_cost_usd, 0)
 
-    # Phase 9 cost model metadata
+    # ── 12e. Phase 9: Parametric cost model ─────────────────────────────────
+    # Fix 19: Moved to before export_geojson so cost_result fields appear in
+    # the 2D GeoJSON properties. The old position (after export) meant the
+    # cost fields were only generated for the 3D GeoJSON, not the 2D one.
+    cost_result = None
+    timer.start("12e_cost_model")
+    try:
+        from cost_model import compute_cost_model, export_cost_csv
+        cost_result = compute_cost_model(
+            meta=meta,
+            ew_result=ew_result,
+            si_result=si_result,
+            scenario_profile=SCENARIO_PROFILE,
+            lulc_wgs=lulc_wgs,
+            cut_rate_usd_m3=EARTHWORK_CUT_RATE_USD_M3,
+            fill_rate_usd_m3=EARTHWORK_FILL_RATE_USD_M3,
+            pavement_rate_m2=PAVEMENT_RATE_USD_M2,
+            corridor_width_m=CORRIDOR_WIDTH_M,
+            land_acq_default=LAND_ACQ_DEFAULT_USD_PER_HA,
+            land_acq_rates=LAND_ACQ_RATES,
+            env_factor=ENV_MITIGATION_FACTOR,
+            contingency_factor=CONTINGENCY_FACTOR,
+            engineering_factor=ENGINEERING_FACTOR,
+        )
+        export_cost_csv(cost_result, OUTPUT_COST_CSV)
+    except Exception as exc:
+        log.warning(f"Cost model failed ({exc}) — skipping.")
+        import traceback as _tb
+        _tb.print_exc()
+    finally:
+        timer.stop()
+
+    # Phase 9 cost model metadata (populated before GeoJSON so fields are included)
     if cost_result is not None:
         meta['cost_model_version']         = 'Phase9'
         meta['total_project_cost_USD']     = round(cost_result.total_project_cost_usd, 0)
@@ -782,40 +777,6 @@ def main():
             for i, (lon, lat) in enumerate(wgs84_coords)
         ]
         export_geojson_3d(wgs84_coords_3d, meta, OUTPUT_FILE_3D)
-
-    # ── 12e. Phase 9: Parametric cost model (runs after meta is built) ──
-    timer.start("12e_cost_model")
-    try:
-        from cost_model import compute_cost_model, export_cost_csv
-        cost_result = compute_cost_model(
-            meta=meta,
-            ew_result=ew_result,
-            si_result=si_result,
-            scenario_profile=SCENARIO_PROFILE,
-            lulc_wgs=lulc_wgs,
-            cut_rate_usd_m3=EARTHWORK_CUT_RATE_USD_M3,
-            fill_rate_usd_m3=EARTHWORK_FILL_RATE_USD_M3,
-            pavement_rate_m2=PAVEMENT_RATE_USD_M2,
-            corridor_width_m=CORRIDOR_WIDTH_M,
-            land_acq_default=LAND_ACQ_DEFAULT_USD_PER_HA,
-            land_acq_rates=LAND_ACQ_RATES,
-            env_factor=ENV_MITIGATION_FACTOR,
-            contingency_factor=CONTINGENCY_FACTOR,
-            engineering_factor=ENGINEERING_FACTOR,
-        )
-        export_cost_csv(cost_result, OUTPUT_COST_CSV)
-        # Back-patch meta with cost summary
-        meta['cost_model_version']     = 'Phase9'
-        meta['total_project_cost_USD'] = round(cost_result.total_project_cost_usd, 0)
-        meta['cost_per_km_USD']        = round(cost_result.cost_per_km_usd, 0)
-        meta['civil_subtotal_USD']     = round(cost_result.civil_subtotal_usd, 0)
-        meta['land_acquisition_ha']    = round(cost_result.land_acquisition_ha, 1)
-    except Exception as exc:
-        log.warning(f"Cost model failed ({exc}) — skipping.")
-        import traceback as _tb
-        _tb.print_exc()
-    finally:
-        timer.stop()
 
 
     # ── 12f. Phase 10: Feasibility report ────────────────────────────────

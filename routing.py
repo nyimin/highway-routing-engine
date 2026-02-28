@@ -99,7 +99,9 @@ def _gradient_descent_path(travel_time, start_rc, end_rc, max_steps=100_000):
     visited = {(end_rc[0], end_rc[1])}
     step_size = 0.8  # sub-pixel step (< 1.0 avoids overshooting)
     stall = 0        # consecutive steps without visiting a new cell
-    max_stall = 50   # break if stuck oscillating in one cell
+    # Fix 6: Raised from 50 → 200; a plateau on the FMM surface near the
+    # grid border can produce many equal-gradient steps before the path escapes.
+    max_stall = 200
 
     for _ in range(max_steps):
         ri, ci = int(round(r)), int(round(c))
@@ -359,6 +361,17 @@ def find_optimal_crossings(water_mask, macro_path, transform, resolution_m,
                     braiding = 3.0
 
             score = width_m * _bank_stability_score(water_mask, r, c, dem, resolution_m) * braiding
+            
+            # Distance penalty: penalize sites that are far from the original macro-path crossing.
+            # We use a steep quadratic penalty to strongly anchor the bridge to the center chainage.
+            # A 1000m deviation doubles the effective bridge score, making detours unappealing
+            # unless the span reduction is massive.
+            if path_idx is not None:
+                dist_from_centre_px = abs(path_idx - seg_centre_idx)
+                dist_m = dist_from_centre_px * resolution_m
+                dist_penalty = 1.0 + (dist_m / 1000.0)**2
+                score *= dist_penalty
+
             if score < best_score_for_seg:
                 best_score_for_seg, best_rc_for_seg = score, (r, c)
 
@@ -404,19 +417,24 @@ def multi_pass_routing(cost, start_rc, end_rc, water_mask, transform,
             clean_bridges.append(br)
 
     log.info(f"Found {len(clean_bridges)} bridge sites. Applying soft corridors...")
-    
+
     # Create soft corridors at bridge sites instead of forcing hard waypoints
     corridor_cost = apply_rubber_band_penalty(
         cost, start_rc, end_rc, weight=RUBBER_BAND_MICRO_W, reference_mask=reference_mask
     )
-    
-    # For each bridge site, paint a deeply discounted swath across the river
+
+    # Fix 7: Widen crossing attraction zone and use a safe cost floor.
+    # The old 0.01× discount created a near-zero singularity where Dijkstra
+    # could route an arbitrary detour through the bridge zone for free.
+    # New approach: discount factor 0.05× with a floor of 1.0, disk radius
+    # widened to 8 px (240 m) so the attraction zone covers a full river width.
     from skimage.draw import disk
     for r, c in clean_bridges:
-        # Paint a 5-pixel (150m) discounted radius around the optimal crossing
-        rr, cc = disk((r, c), radius=5, shape=corridor_cost.shape)
-        # Attract the path to this crossing zone without forcing a literal 1-pixel kink
-        corridor_cost[rr, cc] = corridor_cost[rr, cc] * 0.01
+        rr, cc = disk((r, c), radius=8, shape=corridor_cost.shape)
+        corridor_cost[rr, cc] = np.maximum(
+            corridor_cost[rr, cc] * 0.05,
+            1.0,   # absolute minimum: never cheaper than baseline terrain
+        )
         
     log.info("Running single continuous micro-alignment through soft corridors...")
     full_path = find_path(corridor_cost, start_rc, end_rc)

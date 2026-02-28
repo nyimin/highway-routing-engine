@@ -91,6 +91,20 @@ def _reproject_to_utm(dem_wgs, wgs_tf, wgs_crs, wgs_w, wgs_h,
         src_nodata=DEM_NODATA_SENTINEL,
         dst_nodata=DEM_NODATA_SENTINEL,
     )
+
+    # Fix I: void-fill the UTM DEM before writing to cache.
+    # Bilinear reprojection can leave edge sentinel cells (values near -9999)
+    # that corrupt slope, earthwork-proxy, and floodplain calculations downstream.
+    # EDT nearest-neighbour fill replaces all sentinel cells with the nearest
+    # valid elevation value, producing a seamless surface for all consumers.
+    nodata_mask = (dem_utm <= DEM_NODATA_SENTINEL + 100)
+    if nodata_mask.any():
+        from scipy.ndimage import distance_transform_edt
+        _, idx = distance_transform_edt(nodata_mask, return_indices=True)
+        dem_utm[nodata_mask] = dem_utm[idx[0][nodata_mask], idx[1][nodata_mask]]
+        n_filled = int(nodata_mask.sum())
+        log.info(f"DEM void-fill: {n_filled:,} nodata cells filled by EDT nearest-neighbour.")
+
     with rasterio.open(
         cache_utm, "w", driver="GTiff",
         height=utm_h, width=utm_w, count=1,
@@ -597,10 +611,14 @@ def fetch_worldcover(bbox_wgs84):
                 ds = rioxarray.open_rasterio(href, chunks="auto")
                 datasets.append(ds)
 
+            # Fix IV: use merge_arrays for a proper spatial mosaic.
+            # xr.concat(..., dim="band") stacked tiles along the band axis
+            # instead of mosaicking them spatially — producing wrong results
+            # for any multi-tile bounding box.
             if len(datasets) == 1:
                 merged = datasets[0]
             else:
-                merged = xr.concat(datasets, dim="band")
+                merged = rioxarray.merge_arrays(datasets, nodata=255)
 
             # Clip to bounding box (WGS-84)
             clipped = merged.rio.clip_box(
@@ -798,21 +816,37 @@ def merge_building_sources(osm_buildings, overture_buildings, dedup_radius_m=15.
     osm_centroids = osm_buildings.geometry.centroid
     ov_centroids = ov_utm.geometry.centroid
 
-    # Build spatial index on OSM centroids for fast nearest-neighbour lookup
-    from shapely import STRtree
-    tree = STRtree(osm_centroids.values)
-
-    # For each Overture centroid, find nearest OSM centroid distance
-    keep_mask = np.ones(len(ov_utm), dtype=bool)
-    for i, ov_c in enumerate(ov_centroids):
-        nearest_idx = tree.nearest(ov_c)
-        nearest_osm = osm_centroids.iloc[nearest_idx]
-        dist = ov_c.distance(nearest_osm)
-        if dist < dedup_radius_m:
-            keep_mask[i] = False
-
-    n_dedup = int((~keep_mask).sum())
-    ov_new = ov_utm[keep_mask].copy()
+    # Fix VIII: Overture dedup via geometry intersection (buffered sjoin).
+    # Old centroid-proximity dedup caused both false-drops (large buildings with
+    # centroids > 15 m apart but overlapping footprints) and false-keeps
+    # (footprints whose centroids differ by > 15 m due to digitisation angle).
+    # New: buffer Overture footprints by 10 m and spatial-join against OSM.
+    # Any Overture building that intersects an OSM building within 10 m is
+    # treated as a duplicate and dropped.
+    try:
+        ov_buffered = ov_utm.copy()
+        ov_buffered["geometry"] = ov_utm.geometry.buffer(10.0)
+        duplicates = gpd.sjoin(
+            ov_buffered, osm_buildings[["geometry"]],
+            how="inner", predicate="intersects"
+        )
+        dup_indices = duplicates.index.unique()
+        ov_new = ov_utm.drop(index=dup_indices).copy()
+        n_dedup = len(ov_utm) - len(ov_new)
+    except Exception as exc:
+        # Fallback to centroid-proximity if sjoin fails (e.g. empty GDF)
+        log.warning(f"Overture sjoin dedup failed ({exc}), falling back to centroid proximity.")
+        keep_mask = np.ones(len(ov_utm), dtype=bool)
+        from shapely import STRtree
+        tree = STRtree(osm_centroids.values)
+        for i, ov_c in enumerate(ov_centroids):
+            nearest_idx = tree.nearest(ov_c)
+            nearest_osm = osm_centroids.iloc[nearest_idx]
+            dist = ov_c.distance(nearest_osm)
+            if dist < dedup_radius_m:
+                keep_mask[i] = False
+        n_dedup = int((~keep_mask).sum())
+        ov_new = ov_utm[keep_mask].copy()
 
     # Ensure schema compatibility — keep only geometry column
     ov_new = ov_new[["geometry"]].copy()

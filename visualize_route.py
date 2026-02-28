@@ -585,18 +585,18 @@ def _plot_folium_map(route_wgs84, slope_along_route, meta, thresholds,
         water_fg = folium.FeatureGroup(name="Water Bodies", show=False)
         sample_size = min(2000, len(water_wgs))
         water_sample = water_wgs.sample(n=sample_size, random_state=42) if len(water_wgs) > sample_size else water_wgs
-        for _, row in water_sample.iterrows():
-            geom = row.geometry
-            if geom is None or geom.is_empty:
-                continue
-            try:
-                centroid = geom.centroid
-                folium.CircleMarker(
-                    [centroid.y, centroid.x], radius=3,
-                    color="blue", fill=True, fill_color="blue", fill_opacity=0.4
-                ).add_to(water_fg)
-            except Exception:
-                continue
+        
+        import json
+        style = {"fillColor": "#3186cc", "color": "#3186cc", "weight": 1.5, "fillOpacity": 0.5}
+        try:
+            folium.GeoJson(
+                water_sample.to_json(),
+                style_function=lambda x: style,
+                tooltip=folium.features.GeoJsonTooltip(fields=['name'], aliases=['River:']),
+            ).add_to(water_fg)
+        except Exception as e:
+            log.warning(f"Folium GeoJson rendering for water failed: {e}")
+        
         water_fg.add_to(m)
 
     # ── Phase 8: Structures layer (bridges + culverts) ─────────────────────

@@ -77,9 +77,13 @@ def test_earthwork_cost_formula():
 
 def test_pavement_area():
     """
-    100 km × 11 m formation × 120 USD/m² = USD 132_000_000.
-    pavement_area_m2 = 100_000 × 11 = 1_100_000 m².
+    Fix 20: Pavement is now billed on CARRIAGEWAY width only.
+    For rural_trunk, CARRIAGEWAY_WIDTH_M = 7 m (from config).
+    Expected: 100 km × 7 m × 120 USD/m² = USD 84_000_000.
+    pavement_area_m2 = 100_000 × 7 = 700_000 m².
     """
+    from config import CARRIAGEWAY_WIDTH_M
+    expected_cw = CARRIAGEWAY_WIDTH_M.get("rural_trunk", 7.0)
     result = compute_cost_model(
         meta=_make_meta(length_km=100.0, formation_width_m=11.0),
         ew_result=None, si_result=None,
@@ -87,14 +91,15 @@ def test_pavement_area():
         pavement_rate_m2=120.0,
         land_acq_default=0.0,
         env_factor=0.0, contingency_factor=0.0, engineering_factor=0.0,
+        scenario_profile="rural_trunk",
     )
-    expected_area = 100_000.0 * 11.0
+    expected_area = 100_000.0 * expected_cw
     expected_cost = expected_area * 120.0
     assert abs(result.pavement_area_m2 - expected_area) < 1.0, (
-        f"Pavement area wrong: {result.pavement_area_m2}"
+        f"Pavement area wrong: {result.pavement_area_m2} (expected {expected_area})"
     )
     assert abs(result.pavement_usd - expected_cost) < 1.0, (
-        f"Pavement cost wrong: {result.pavement_usd}"
+        f"Pavement cost wrong: {result.pavement_usd} (expected {expected_cost})"
     )
     print("  ✓ test_pavement_area")
 
@@ -103,16 +108,18 @@ def test_pavement_area():
 
 def test_contingency_engineering():
     """
-    civil_subtotal = USD 10_000_000 (from pavement only).
+    Drive civil subtotal via earthwork (not pavement) to avoid Fix 20 carriageway-width effects.
+    Earthwork cut: 1_000_000 m³ × USD 10 = USD 10_000_000 civil subtotal.
     contingency = 20% = USD 2_000_000.
     engineering = 10% = USD 1_000_000.
     """
-    # 1 km × 1 m formation × USD 10_000/m² → civil = 10_000_000
+    ew = _MockEW(cut_m3=1_000_000.0, net_import_m3=0.0)   # 0 import fill
     result = compute_cost_model(
-        meta=_make_meta(length_km=1.0, formation_width_m=1.0),
-        ew_result=None, si_result=None,
-        cut_rate_usd_m3=0.0, fill_rate_usd_m3=0.0,
-        pavement_rate_m2=10_000.0,
+        meta=_make_meta(length_km=1.0, formation_width_m=11.0),
+        ew_result=ew, si_result=None,
+        cut_rate_usd_m3=10.0,
+        fill_rate_usd_m3=0.0,
+        pavement_rate_m2=0.0,    # isolate earthwork
         land_acq_default=0.0,
         env_factor=0.0,
         contingency_factor=0.20,

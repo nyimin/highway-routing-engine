@@ -1,0 +1,4 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.5, pytest-9.0.2, pluggy-1.6.0 -- D:\Triune\Stack Space - Documents\Code\Infra_Proj\.venv\Scripts\python.exe
+cachedir: .pytest_cache
+rootdir: D:\Triune\Stack Space - Documents\Code\Infra_Proj

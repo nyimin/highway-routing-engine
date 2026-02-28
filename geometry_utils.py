@@ -200,10 +200,10 @@ def smooth_path(coords_utm, n_points=None, smoothing=None,
     """
     Segment-aware B-spline smoothing.
 
-    If slope_pct and transform are provided, the global smoothing factor is
-    modulated by local terrain complexity:
-      - Flat segments (mean slope ≤ 4%) → heavy smoothing (s × 8)
-      - Mountain segments (mean slope > 8%) → light smoothing (s × 1)
+    If slope_pct and transform are provided, the smoothing factor is
+    modulated by local terrain complexity using B-spline weights (w):
+      - Flat segments (mean slope ≤ 4%) → low weight (higher smoothing)
+      - Mountain segments (mean slope > 8%) → high weight (hugs points tighter)
       - Transitions → linearly interpolated
 
     This prevents over-smoothing on switchback sections while still producing
@@ -220,25 +220,37 @@ def smooth_path(coords_utm, n_points=None, smoothing=None,
         dist = sum(math.hypot(xs[i] - xs[i-1], ys[i] - ys[i-1]) for i in range(1, len(xs)))
         n_points = max(500, int(dist / 10.0))
 
-    base_s = len(coords_utm) * 4.0 if smoothing is None else smoothing
+    # A typical deviation of ~40 meters is needed to smooth out 30m grid staircasing.
+    # The B-spline parameter 's' is the allowed sum of squared distances.
+    # s = N * (average_deviation)^2. For 40m deviation, s = N * 1600.
+    base_s = len(coords_utm) * 1600.0 if smoothing is None else smoothing
+    weights = None
 
-    # If terrain info available, compute adaptive smoothing
+    # If terrain info available, compute adaptive smoothing weights
     if slope_pct is not None and transform is not None:
         local_slopes = _segment_slope_means(coords_utm, slope_pct, transform)
         # Map mean slope to a smoothing multiplier [1.0, 8.0]
         flat_thresh  = SLOPE_MAX_PCT * 0.4   # ≈ lower 40% of threshold = smooth heavily
         steep_thresh = SLOPE_MAX_PCT * 0.8   # upper 80% = preserve detail
         t = np.clip((local_slopes - flat_thresh) / max(steep_thresh - flat_thresh, 0.01), 0, 1)
-        smooth_mult = 8.0 - t * 7.0   # 8.0 (flat) → 1.0 (mountain)
-        # Use median to get a single representative factor for the whole path
-        # (full per-segment spline would require splitting and stitching)
-        adaptive_s = base_s * float(np.median(smooth_mult))
-        log.info(f"Adaptive smoothing: base_s={base_s:.0f}, factor={float(np.median(smooth_mult)):.2f}x → s={adaptive_s:.0f}")
-    else:
-        adaptive_s = base_s
+        # smooth_mult: 8.0 (flat, high smoothing) -> 1.0 (mountain, low smoothing)
+        smooth_mult = 8.0 - t * 7.0
+        
+        # scipy.interpolate.splprep uses weights 'w' where the error is minimized as:
+        # sum(w * (y - spline(x))^2) <= s
+        # To make a point have LESS deviation (tight curve), it needs a HIGHER weight.
+        # So weight is inverse to the "smoothing multiplier". Let's use 1 / sqrt(smooth_mult).
+        # When smooth_mult is 8 (flat), w is small (0.35) -> error can be large -> smooth
+        # When smooth_mult is 1 (steep), w is large (1.0) -> error must be small -> tight
+        weights = 1.0 / np.sqrt(smooth_mult)
+        log.info(f"Adaptive smoothing: using per-point weights derived from terrain. Base s={base_s:.0f}")
 
     try:
-        tck, u = splprep([xs, ys], s=adaptive_s, k=3)
+        if weights is not None:
+            tck, u = splprep([xs, ys], w=weights, s=base_s, k=3)
+        else:
+            tck, u = splprep([xs, ys], s=base_s, k=3)
+            
         u_fine = np.linspace(0, 1, n_points)
         x_sm, y_sm = splev(u_fine, tck)
         return list(zip(x_sm.tolist(), y_sm.tolist()))
@@ -415,18 +427,39 @@ def extract_longitudinal_profile(coords_utm, dem, transform):
     """
     Walk the alignment and sample DEM elevation at each waypoint.
     Returns (distances_m, elevations_m) arrays.
+
+    Fix 16: Uses bilinear interpolation instead of nearest-pixel sampling,
+    which reduces staircase artefacts by up to 30 m in steep terrain and
+    provides smoother input to PCHIP in the vertical alignment step.
     """
     rows, cols = dem.shape
     dists = [0.0]
     elevs = []
 
     for i, (x, y) in enumerate(coords_utm):
-        c = int((x - transform.c) / transform.a)
-        r = int((y - transform.f) / transform.e)
-        if 0 <= r < rows and 0 <= c < cols:
-            elevs.append(float(dem[r, c]))
-        else:
-            elevs.append(elevs[-1] if elevs else 0.0)
+        # Fractional pixel column / row
+        fc = (x - transform.c) / transform.a - 0.5   # subtract 0.5 for cell-centre
+        fr = (y - transform.f) / transform.e - 0.5
+        c0 = int(math.floor(fc))
+        r0 = int(math.floor(fr))
+        # Clamp to valid grid
+        c0 = max(0, min(cols - 2, c0))
+        r0 = max(0, min(rows - 2, r0))
+        c1, r1 = c0 + 1, r0 + 1
+
+        # Bilinear weights
+        tc = fc - c0   # fractional part in column direction
+        tr = fr - r0   # fractional part in row direction
+        tc = max(0.0, min(1.0, tc))
+        tr = max(0.0, min(1.0, tr))
+
+        z = (
+            dem[r0, c0] * (1 - tr) * (1 - tc)
+            + dem[r0, c1] * (1 - tr) * tc
+            + dem[r1, c0] * tr       * (1 - tc)
+            + dem[r1, c1] * tr       * tc
+        )
+        elevs.append(float(z))
         if i > 0:
             x0, y0 = coords_utm[i - 1]
             dists.append(dists[-1] + math.hypot(x - x0, y - y0))
@@ -456,7 +489,10 @@ def check_sustained_grade(elevations_m, distances_m, max_grade=0.08, window_m=3_
         grade = dz / dx if dx > 0 else 0.0
         if grade > max_grade:
             violations.append((distances_m[i], distances_m[j], round(grade * 100, 2)))
-        i += max(1, (j - i) // 2)
+        # Fix 15: Advance by the full window stride, not half-stride.
+        # Half-stride caused adjacent windows to share the same violation interval,
+        # producing duplicate entries for the same sustained-grade section.
+        i = j
 
     if violations:
         log.warning(
