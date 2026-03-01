@@ -5,7 +5,7 @@ It fetches elevation (DEM) and infrastructure data (OpenStreetMap), builds a
 multi-layer cost surface, runs two-resolution pathfinding, and exports
 engineering-grade GeoJSON outputs with a 10-product visualization suite.
 
-> **Current phase: 14.4** — Routing Logic Corrections (Coastward Detour / Additive Water Penalty Fixes), Custom Water `.gpkg` Integration, and Dam & Reservoir Absolute Avoidance complete.
+> **Current phase: 17.0** — Constraint-First Bridge Scouting & River Avoidance.
 
 ---
 
@@ -21,6 +21,7 @@ engineering-grade GeoJSON outputs with a 10-product visualization suite.
 
 - **Slope cost** with 4-zone thresholds (optimal / moderate / max / cliff) and exponential ramp.
 - **River hierarchy** — connected-component analysis classifies water into 5 tiers (culvert → Ayeyarwady-scale) with perpendicular crossing enforcement. Integrated custom GeoPackage datasets for high-fidelity true-width river polygons.
+- **Constraint-First Bridge Siting** — major rivers (Tier 3 & 4) are completely `IMPASSABLE` by default. Instead, an upfront Bridge Scouting pass identifies optimal crossing axes and dynamically burns "passable corridors" into the cost surface.
 - **Dam & Reservoir Avoidance** — explicit geographical buffering around sensitive water infrastructure permanently excluded with `IMPASSABLE` routing costs.
 - **Area-based building penalties** — footprint-scaled peak penalty with continuous EDT distance-decay gradient (Phase 5.2).
 - **LULC environmental multipliers** — wetland, forest, farmland, conservation areas.
@@ -30,9 +31,10 @@ engineering-grade GeoJSON outputs with a 10-product visualization suite.
 
 - **Multi-Scale LCP (MS-LCP)** — progressive resolution cost pyramid, 45° directional waypoint extraction, and parallel segmented routing (based on Tang & Dou, 2023).
 - **Rubber-band centering** — distance-transform penalty prevents meandering; bounding-box-diagonal normalization avoids over-penalization in narrow corridors.
+- **Constraint-First Bridge Scouting** — the MS-LCP algorithm initiates with a massive downsampled pyramid search (e.g. 120m) to scout for optimal perpendicular bridges across `IMPASSABLE` rivers. These structures are identified using dynamic width minimization and riverbank stability metrics, then injected back into the cost hierarchy.
 - **Sub-pixel FMM gradient descent** — eliminates grid stair-step artifacts (Phase 5.3).
 - **Sharp-reversal filter** — removes near-180° waypoint stutters (configurable via `TURNING_ANGLE_FILTER_DEG`).
-- **Bridge siting** — `multi_pass_routing` enables sequential point-to-point connections over $N$ consecutive bridge locations, explicitly forcing routing engines to bridge across all filtered major water bodies.
+- **Multi-Waypoint Routing (A → B → C)** — sequential leg processing with recursive stitching and segment-aware tracking.
 - **Engine auto-selection**: `scikit-fmm` if available, otherwise Dijkstra.
 
 ### Geometry & Vertical Alignment (Phase 6)
@@ -50,8 +52,8 @@ engineering-grade GeoJSON outputs with a 10-product visualization suite.
 
 ### Cost & Reporting (Phases 9–10)
 
-- **Parametric Cost Model**: Aggregates earthwork, pavement, structures, and land acquisition (LULC-weighted) into a project USD cost.
-- **Automated Feasibility Report**: Jinja2 + WeasyPrint driven HTML/PDF generation presenting the executive summary, engineering profiles, and cost estimate.
+- **Parametric Cost Model**: Aggregates earthwork, pavement, structures, and land acquisition (LULC-weighted) into a project USD cost with **Segment-Specific Breakdowns**.
+- **Automated Feasibility Report**: Jinja2 + WeasyPrint driven HTML/PDF generation presenting the executive summary, engineering profiles, segment subtotals, and cost estimate.
 
 ### Performance
 
@@ -148,10 +150,16 @@ pip install weasyprint jinja2 # Required for PDF/HTML report generation
 
 ### 1. Configure
 
-Edit `config.py` to set your start/end coordinates (`POINT_A`, `POINT_B`), UTM zone
+Edit `config.py` to set your sequence of waypoints (`WAYPOINTS`), UTM zone
 (`UTM_EPSG`), resolution, slope thresholds, and feature flags:
 
 ```python
+WAYPOINTS = [
+    (94.2175, 17.5483), # Point A (lon, lat)
+    (95.5000, 17.3000), # Midpoint 1
+    (96.8304, 17.1174), # Point B
+]
+
 EXPORT_INTERMEDIATES     = True   # Save cost_surface.tif, building_penalty.tif
 GENERATE_VISUALIZATIONS  = True   # Auto-run the 10-product viz suite
 FAST_MODE                = False  # True = coarse-only (300 m) for rapid screening
@@ -183,17 +191,20 @@ The pipeline will:
 
 ## Configuration Reference
 
-| Constant                   | Default               | Description                                    |
-| -------------------------- | --------------------- | ---------------------------------------------- |
-| `RESOLUTION`               | 30                    | Grid cell size (metres)                        |
-| `PYRAMID_LEVELS`           | 3                     | Number of downscaling levels for MS-LCP        |
-| `DOWNSAMPLE_RATIO`         | 2                     | Factor to downscale the cost surface per level |
-| `SLOPE_MAX_PCT`            | 12                    | Maximum design slope (%)                       |
-| `SLOPE_CLIFF_PCT`          | 25                    | Impassable cliff threshold (%)                 |
-| `TURNING_ANGLE_FILTER_DEG` | 160                   | Filter near-reversal waypoints (°)             |
-| `MEMORY_WARN_GB`           | 4.0                   | Auto-escalate coarse factor above this         |
-| `WATER_PENALTY_TIERS`      | [5,50,500,5000,50000] | Per-tier river crossing multipliers            |
-| `ROAD_DISCOUNT`            | 0.5                   | Existing-road cost multiplier                  |
+| Constant                    | Default                                     | Description                                         |
+| --------------------------- | ------------------------------------------- | --------------------------------------------------- |
+| `RESOLUTION`                | 30                                          | Grid cell size (metres)                             |
+| `PYRAMID_LEVELS`            | 3                                           | Number of downscaling levels for MS-LCP             |
+| `DOWNSAMPLE_RATIO`          | 2                                           | Factor to downscale the cost surface per level      |
+| `SLOPE_MAX_PCT`             | 12                                          | Maximum design slope (%)                            |
+| `SLOPE_CLIFF_PCT`           | 25                                          | Impassable cliff threshold (%)                      |
+| `TURNING_ANGLE_FILTER_DEG`  | 160                                         | Filter near-reversal waypoints (°)                  |
+| `MEMORY_WARN_GB`            | 4.0                                         | Auto-escalate coarse factor above this              |
+| `WATER_PENALTY_TIERS`       | [2000, 8000, 50000, IMPASSABLE, IMPASSABLE] | Per-tier river crossing multipliers                 |
+| `ROAD_DISCOUNT`             | 0.5                                         | Existing-road cost multiplier                       |
+| `BRIDGE_SCOUT_RESOLUTION_M` | 120.0                                       | Resolution for the pre-routing bridge scouting pass |
+| `TILE_ROUTING_THRESHOLD_KM` | 150                                         | Use tile routing if leg is longer than this         |
+| `WAYPOINTS`                 | list                                        | List of (lon, lat) waypoints for the route          |
 
 See `config.py` for the full list.
 

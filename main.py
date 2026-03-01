@@ -13,6 +13,7 @@ Changes vs original:
 """
 import json
 import logging
+import math
 import os
 import time
 import traceback
@@ -22,10 +23,11 @@ import numpy as np
 from shapely.geometry import LineString
 
 from config import (
-    POINT_A, POINT_B, UTM_EPSG, ROW_BUFFER_M, SLOPE_MAX_PCT,
+    WAYPOINTS, UTM_EPSG, ROW_BUFFER_M, SLOPE_MAX_PCT,
     BORDER_CELLS, IMPASSABLE, RESOLUTION, OUTPUT_FILE,
     CHECKPOINT_FILE, FORCE_RESTART,
     MEMORY_WARN_GB, TILE_ROUTING_THRESHOLD_KM, PERF_TIMING_ENABLED,
+    ENABLE_TILE_ROUTING, TILE_LENGTH_KM, TILE_OVERLAP_KM, TILE_LATERAL_MARGIN_DEG,
     COARSE_FACTOR, CORRIDOR_BAND_KM,
     EXPORT_INTERMEDIATES, GENERATE_VISUALIZATIONS,
     SLOPE_OPTIMAL_PCT, SLOPE_MODERATE_PCT, SLOPE_CLIFF_PCT,
@@ -49,9 +51,13 @@ from config import (
     OUTPUT_REPORT_HTML, OUTPUT_REPORT_PDF,
     # Phase 11
     USE_WORLDCOVER_LULC, USE_OVERTURE_BUILDINGS, OVERTURE_DEDUP_RADIUS_M,
+    # Phase 14.5
+    BUILDING_BASE_PENALTY, BUILDING_AREA_MULT, ROW_BUFFER_M as ROW_BUFFER_M_CFG,
+    ENABLE_RASTER_CACHE,
 )
 from geometry_utils import (
-    bbox_with_margin, wgs84_to_utm, utm_to_wgs84, xy_to_rowcol, rowcol_to_xy,
+    bbox_with_margin, wgs84_to_utm, utm_to_wgs84,
+    xy_to_rowcol, rowcol_to_xy,
     smooth_path, verify_curve_radius, verify_row_setback, compute_metadata,
     verify_design_lengths,
     export_geojson, export_geojson_3d,
@@ -61,7 +67,8 @@ from geometry_utils import (
 from data_fetch import (
     fetch_dem, fetch_osm_layers, derive_stream_mask_utm,
     fetch_worldcover, fetch_overture_buildings, merge_building_sources,
-    fetch_custom_water, fetch_dam_lake
+    fetch_custom_water, fetch_dam_lake,
+    RasterCache, _cache_fingerprint,  # Phase 14.5
 )
 from cost_surface import (
     compute_slope, rasterise_layer, build_cost_surface,
@@ -187,6 +194,184 @@ class CheckpointManager:
             log.info("Checkpoint cleared (pipeline completed successfully).")
 
 
+def run_leg_monolithic(pt_a, pt_b, bbox, timer, ckpt, warn_handler):
+    """
+    Rounds out Phase 16 refactoring by isolating the monolithic pipeline 
+    so it can be easily called iteratively per leg.
+    Returns path_utm.
+    """
+    from data_fetch import (
+        fetch_dem, fetch_osm_layers, fetch_custom_water, fetch_dam_lake,
+        fetch_overture_buildings, merge_building_sources, RasterCache,
+        derive_stream_mask_utm, _cache_fingerprint,
+    )
+    from cost_surface import (
+        compute_slope, rasterise_layer, build_cost_surface,
+        worldcover_to_lulc_raster, build_cost_pyramid,
+    )
+    from routing import multi_scale_lcp
+    from structures import filter_bridge_worthy_water
+    from config import USE_CUSTOM_WATER, USE_DAM_LAKE_AVOIDANCE, DAM_LAKE_BUFFER_M
+
+    # ── 2. DEM
+    dem, transform, dem_source = fetch_dem(bbox)
+    rows, cols = dem.shape
+
+    # ── 3. OSM layers
+    buildings_wgs, water_wgs, roads_wgs, lulc_wgs, osm_stats = fetch_osm_layers(bbox)
+
+    def to_utm(gdf):
+        if gdf is None or len(gdf) == 0:
+            return gdf
+        return gdf.to_crs(epsg=UTM_EPSG)
+
+    buildings_utm = to_utm(buildings_wgs)
+    water_utm     = to_utm(water_wgs)
+    roads_utm     = to_utm(roads_wgs)
+    lulc_utm      = to_utm(lulc_wgs)
+
+    if USE_CUSTOM_WATER:
+        custom_water_wgs = fetch_custom_water(bbox)
+        if custom_water_wgs is not None and len(custom_water_wgs) > 0:
+            custom_water_utm = to_utm(custom_water_wgs)
+            import pandas as pd
+            if "natural" not in custom_water_utm.columns:
+                custom_water_utm["natural"] = "water"
+            else:
+                custom_water_utm["natural"] = custom_water_utm["natural"].fillna("water")
+            if water_utm is None or len(water_utm) == 0:
+                water_utm = custom_water_utm
+            else:
+                water_utm = pd.concat([water_utm, custom_water_utm], ignore_index=True)
+
+    exclusion_gdf_utm = None
+    if USE_DAM_LAKE_AVOIDANCE:
+        dam_lake_wgs = fetch_dam_lake(bbox)
+        if dam_lake_wgs is not None and len(dam_lake_wgs) > 0:
+            dam_lake_utm = to_utm(dam_lake_wgs)
+            if DAM_LAKE_BUFFER_M > 0:
+                dam_lake_utm["geometry"] = dam_lake_utm.geometry.buffer(DAM_LAKE_BUFFER_M)
+            exclusion_gdf_utm = dam_lake_utm
+
+    if water_utm is not None and len(water_utm) > 0:
+        water_utm = filter_bridge_worthy_water(water_utm)
+
+    if USE_OVERTURE_BUILDINGS:
+        overture_wgs = fetch_overture_buildings(bbox)
+        if overture_wgs is not None and len(overture_wgs) > 0:
+            buildings_utm = merge_building_sources(
+                buildings_utm, overture_wgs,
+                dedup_radius_m=OVERTURE_DEDUP_RADIUS_M,
+            )
+
+    slope_pct, nodata_mask, curvature = compute_slope(dem, RESOLUTION)
+
+    rcache = RasterCache()
+    building_penalty_map = np.zeros((rows, cols), dtype=np.float32)
+    if buildings_utm is not None and len(buildings_utm) > 0:
+        from config import ROW_BUFFER_M as ROW_BUFFER_M_CFG
+        bldg_fp = _cache_fingerprint(
+            len(buildings_utm), (rows, cols),
+            BUILDING_BASE_PENALTY, BUILDING_AREA_MULT, ROW_BUFFER_M_CFG, RESOLUTION,
+        )
+        cached_bldg, bldg_hit = rcache.get("building_penalty", bldg_fp, shape=(rows, cols))
+        if bldg_hit:
+            building_penalty_map = cached_bldg.astype(np.float32)
+        else:
+            from cost_surface import _apply_building_penalties
+            building_penalty_map = _apply_building_penalties(buildings_utm, transform, (rows, cols), RESOLUTION)
+            rcache.put("building_penalty", bldg_fp, building_penalty_map, transform)
+
+    water_fp = _cache_fingerprint(len(water_utm) if water_utm is not None else 0, (rows, cols))
+    cached_water, water_hit = rcache.get("water_mask", water_fp, shape=(rows, cols))
+    if water_hit:
+        water_mask = cached_water.astype(np.float32)
+    else:
+        water_mask = rasterise_layer(water_utm, transform, (rows, cols))
+        rcache.put("water_mask", water_fp, water_mask, transform)
+
+    roads_fp = _cache_fingerprint(len(roads_utm) if roads_utm is not None else 0, (rows, cols))
+    cached_roads, roads_hit = rcache.get("roads_mask", roads_fp, shape=(rows, cols))
+    if roads_hit:
+        roads_mask = cached_roads.astype(np.float32)
+    else:
+        roads_mask = rasterise_layer(roads_utm, transform, (rows, cols))
+        rcache.put("roads_mask", roads_fp, roads_mask, transform)
+
+    from cost_surface import _apply_lulc_penalties
+    lulc_penalty_map = np.full((rows, cols), 1.0, dtype=np.float32)
+    if USE_WORLDCOVER_LULC:
+        wc_array, wc_transform = fetch_worldcover(bbox)
+        if wc_array is not None:
+            lulc_penalty_map = worldcover_to_lulc_raster(
+                wc_array, wc_transform,
+                target_shape=(rows, cols),
+                target_transform=transform,
+                slope_pct=slope_pct,
+            )
+    if lulc_utm is not None and len(lulc_utm) > 0:
+        osm_penalty_map = _apply_lulc_penalties(lulc_utm, transform, (rows, cols), slope_pct=slope_pct)
+        np.maximum(lulc_penalty_map, osm_penalty_map, out=lulc_penalty_map)
+
+    if osm_stats.get('dem_stream_fallback'):
+        dem_streams = derive_stream_mask_utm(dem, transform, resolution_m=RESOLUTION)
+        water_mask = np.maximum(water_mask, dem_streams).astype(np.float32)
+        from rasterio.features import shapes
+        from shapely.geometry import shape
+        import geopandas as gpd
+        vectors = []
+        for geom, val in shapes((dem_streams > 0).astype(np.int32), mask=(dem_streams > 0), transform=transform):
+            poly = shape(geom)
+            vectors.append(poly)
+        if vectors:
+            dem_water_gdf = gpd.GeoDataFrame({"waterway": ["dem_stream"] * len(vectors)}, geometry=vectors, crs=f"EPSG:{UTM_EPSG}")
+            if water_utm is None or len(water_utm) == 0:
+                water_utm = dem_water_gdf
+            else:
+                import pandas as pd
+                water_utm = pd.concat([water_utm, dem_water_gdf], ignore_index=True)
+
+    cost = build_cost_surface(
+        slope_pct, building_penalty_map, water_mask,
+        roads_mask=roads_mask, roads_gdf=roads_utm,
+        lulc_penalty_map=lulc_penalty_map,
+        nodata_mask=nodata_mask, dem=dem, curvature=curvature,
+        resolution_m=RESOLUTION, transform=transform,
+        exclusion_gdf=exclusion_gdf_utm
+    )
+
+    xa, ya = wgs84_to_utm(*pt_a)
+    xb, yb = wgs84_to_utm(*pt_b)
+    start_rc = xy_to_rowcol(xa, ya, transform)
+    end_rc   = xy_to_rowcol(xb, yb, transform)
+
+    b = BORDER_CELLS
+    start_rc = (max(b, min(rows - 1 - b, start_rc[0])), max(b, min(cols - 1 - b, start_rc[1])))
+    end_rc = (max(b, min(rows - 1 - b, end_rc[0])), max(b, min(cols - 1 - b, end_rc[1])))
+
+    for label, rc in [("A", start_rc), ("B", end_rc)]:
+        if cost[rc] >= IMPASSABLE:
+            r, c = rc
+            r0, r1 = max(0, r - 1), min(rows, r + 2)
+            c0, c1 = max(0, c - 1), min(cols, c + 2)
+            neighbourhood = cost[r0:r1, c0:c1].copy()
+            valid_costs = neighbourhood[neighbourhood < IMPASSABLE]
+            floor_cost = float(np.percentile(valid_costs, 5)) if len(valid_costs) > 0 else 1.0
+            floor_cost = max(floor_cost, 1.0)
+            cost[r0:r1, c0:c1] = np.minimum(cost[r0:r1, c0:c1], floor_cost)
+
+    cost_pyramid = build_cost_pyramid(cost, PYRAMID_LEVELS, DOWNSAMPLE_RATIO, DOWNSAMPLE_METHOD)
+    path_indices = multi_scale_lcp(
+        cost_pyramid, start_rc, end_rc, water_mask, transform,
+        resolution_m=RESOLUTION, dem=dem
+    )
+
+    if not path_indices:
+        return []
+
+    return [rowcol_to_xy(r, c, transform) for r, c in path_indices]
+
+
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def main():
@@ -198,47 +383,172 @@ def main():
     log.info("═" * 65)
     log.info("  Highway Alignment Generator  –  Myanmar Preliminary Feasibility")
     log.info("═" * 65)
-    log.info(f"Point A : lon={POINT_A[0]}, lat={POINT_A[1]}")
-    log.info(f"Point B : lon={POINT_B[0]}, lat={POINT_B[1]}")
+    for i, wp in enumerate(WAYPOINTS):
+        log.info(f"Waypoint {i+1} : lon={wp[0]}, lat={wp[1]}")
     log.info(f"UTM CRS : EPSG:{UTM_EPSG}")
 
     # ── 1. Bounding box ────────────────────────────────────────────────────
+    # ── 1. Bounding box ────────────────────────────────────────────────────
     timer.start("1_bbox")
-    bbox = bbox_with_margin(POINT_A, POINT_B)
+    bbox = bbox_with_margin(WAYPOINTS)
     west, south, east, north = bbox
     log.info(f"BBox (WGS-84): W={west:.4f} S={south:.4f} E={east:.4f} N={north:.4f}")
-
-    # Phase 5: corridor straight-line distance check
-    ax, ay = wgs84_to_utm(*POINT_A)
-    bx, by = wgs84_to_utm(*POINT_B)
-    corridor_km = ((bx - ax)**2 + (by - ay)**2)**0.5 / 1000.0
-    log.info(f"Corridor A→B straight: {corridor_km:.1f} km")
-    if corridor_km > TILE_ROUTING_THRESHOLD_KM:
-        log.warning(
-            f"Corridor {corridor_km:.0f} km exceeds TILE_ROUTING_THRESHOLD_KM="
-            f"{TILE_ROUTING_THRESHOLD_KM:.0f} km. Consider enabling FAST_MODE or "
-            f"increasing PYRAMID_LEVELS for large-scale screening."
-        )
     timer.stop()
 
-    # ── 2. DEM (with fallback chain: COP30 → SRTMGL1 → SRTMGL3 → mock) ───
-    if ckpt.get('dem'):
-        log.info("[CHECKPOINT] Skipping DEM fetch (already cached).")
-        _ckd = ckpt.get('dem')
-        dem_source = _ckd['source']
-        # Re-load from cached rasterio file (dem array is rebuilt from cost surface)
-        # For simplicity, still fetch (fast from cache) to get the array
-        dem, transform, dem_source = fetch_dem(bbox)
-    else:
-        dem, transform, dem_source = fetch_dem(bbox)
-        ckpt.save('dem', {'source': dem_source})
-    rows, cols = dem.shape
-    log.info(f"DEM loaded: {rows}×{cols} cells, source={dem_source}")
+    # ── Phase 16: Multi-Waypoint Routing Dispatch ──────────────────────────
+    full_path_utm = []
+    segment_indices = []
 
-    # ── 3. OSM layers ──────────────────────────────────────────────────────
-    log.info("Fetching OSM layers …")
+    for leg_idx in range(len(WAYPOINTS) - 1):
+        pt_a = WAYPOINTS[leg_idx]
+        pt_b = WAYPOINTS[leg_idx + 1]
+        log.info(f"\n{'═'*20} ROUTING LEG {leg_idx + 1}/{len(WAYPOINTS)-1} {'═'*20}")
+        log.info(f"  From: (lon={pt_a[0]:.4f}, lat={pt_a[1]:.4f})")
+        log.info(f"  To:   (lon={pt_b[0]:.4f}, lat={pt_b[1]:.4f})")
+
+        ax, ay = wgs84_to_utm(*pt_a)
+        bx, by = wgs84_to_utm(*pt_b)
+        leg_km = ((bx - ax)**2 + (by - ay)**2)**0.5 / 1000.0
+        log.info(f"  Leg {leg_idx + 1} straight-line: {leg_km:.1f} km")
+
+        use_tile_routing = (
+            leg_km > TILE_ROUTING_THRESHOLD_KM
+            and ENABLE_TILE_ROUTING
+            and not FAST_MODE
+        )
+
+        leg_path_utm = []
+
+        if use_tile_routing:
+            log.info(f"  Activating TILE ROUTING for Leg {leg_idx + 1}")
+            from tile_routing import TilePartitioner, run_tiled_pipeline
+            timer.start(f"leg_{leg_idx+1}_tile_routing")
+            tiles = TilePartitioner(
+                [pt_a, pt_b],
+                tile_length_km=TILE_LENGTH_KM,
+                overlap_km=TILE_OVERLAP_KM,
+                margin_deg=TILE_LATERAL_MARGIN_DEG,
+            ).partition()
+            
+            # Reset global_tile_idx override back to 0 for just this leg
+            for i, t in enumerate(tiles):
+                tiles[i] = t._replace(tile_index=i)
+
+            leg_path_utm = run_tiled_pipeline(tiles, timer=timer, ckpt=ckpt)
+            timer.stop()
+
+            if not leg_path_utm:
+                log.error(f"Tile routing failed for Leg {leg_idx + 1}.")
+                sys.exit(1)
+        else:
+            log.info(f"  Activating MONOLITHIC PIPELINE for Leg {leg_idx + 1}")
+            leg_path_utm = run_leg_monolithic(pt_a, pt_b, bbox, timer, ckpt, warn_handler)
+            if not leg_path_utm:
+                log.error(f"Monolithic routing failed for Leg {leg_idx + 1}.")
+                sys.exit(1)
+
+        # Merge paths
+        if leg_idx > 0 and len(full_path_utm) > 0 and len(leg_path_utm) > 0:
+            # Drop the first point of the next leg if it's identical/very close to the last point
+            last_x, last_y = full_path_utm[-1]
+            first_x, first_y = leg_path_utm[0]
+            if math.hypot(last_x - first_x, last_y - first_y) < 1.0:
+                leg_path_utm = leg_path_utm[1:]
+
+        full_path_utm.extend(leg_path_utm)
+        segment_indices.extend([leg_idx] * len(leg_path_utm))
+
+    path_utm = full_path_utm
+    log.info(f"\nAll {len(WAYPOINTS)-1} legs routed successfully. Total waypoints: {len(path_utm)}\n")
+
+    # For post-processing (smoothing, structures, viz), we still need the
+    # full-corridor DEM, water, and buildings. Fetch them using the
+    # monolithic bbox (these are cached from tile fetches via _tile_key).
+    log.info("Tile routing complete. Loading full-corridor data for post-processing …")
+    dem, transform, dem_source = fetch_dem(bbox)
+    rows, cols = dem.shape
+
     buildings_wgs, water_wgs, roads_wgs, lulc_wgs, osm_stats = fetch_osm_layers(bbox)
 
+    def to_utm(gdf):
+        if gdf is None or len(gdf) == 0:
+            return gdf
+        return gdf.to_crs(epsg=UTM_EPSG)
+
+    buildings_utm = to_utm(buildings_wgs)
+    water_utm = to_utm(water_wgs)
+    roads_utm = to_utm(roads_wgs)
+    lulc_utm  = to_utm(lulc_wgs)
+
+    from config import USE_CUSTOM_WATER
+    if USE_CUSTOM_WATER:
+        custom_water_wgs = fetch_custom_water(bbox)
+        if custom_water_wgs is not None and len(custom_water_wgs) > 0:
+            custom_water_utm = to_utm(custom_water_wgs)
+            import pandas as pd
+        
+            # Add a natural="water" tag so it passes filter_bridge_worthy_water
+            if "natural" not in custom_water_utm.columns:
+                custom_water_utm["natural"] = "water"
+            else:
+                custom_water_utm["natural"] = custom_water_utm["natural"].fillna("water")
+            
+            if water_utm is None or len(water_utm) == 0:
+                water_utm = custom_water_utm
+            else:
+                water_utm = pd.concat([water_utm, custom_water_utm], ignore_index=True)
+            log.info(f"Custom water merged: total water features now {len(water_utm)}.")
+        else:
+            log.info("Custom water: none fetched — using OSM only.")
+
+    # ── 3d. Phase 14.3: Dam & Lake Avoidance Zones ──────────────────────────
+    from config import USE_DAM_LAKE_AVOIDANCE, DAM_LAKE_BUFFER_M
+    exclusion_gdf_utm = None
+    if USE_DAM_LAKE_AVOIDANCE:
+        dam_lake_wgs = fetch_dam_lake(bbox)
+        if dam_lake_wgs is not None and len(dam_lake_wgs) > 0:
+            dam_lake_utm = to_utm(dam_lake_wgs)
+        
+            # Apply geometric buffer for structural avoidance
+            if DAM_LAKE_BUFFER_M > 0:
+                # Store original for export or visuals if needed, buffer the active geometry
+                dam_lake_utm["geometry"] = dam_lake_utm.geometry.buffer(DAM_LAKE_BUFFER_M)
+                log.info(f"Dam/Lake: Buffered exclusion zones by {DAM_LAKE_BUFFER_M} m.")
+        
+            exclusion_gdf_utm = dam_lake_utm
+            log.info(f"Dam/Lake: Registered {len(exclusion_gdf_utm)} strictly avoided geometries.")
+        else:
+            log.info("Dam/Lake: none fetched — no absolute avoidance zones registered.")
+
+    # Harmonize: Pre-filter water polygons to only bridge-worthy rivers
+    # so the routing engine and the structure detector see the exact same rivers.
+    if water_utm is not None and len(water_utm) > 0:
+        from structures import filter_bridge_worthy_water
+        water_utm = filter_bridge_worthy_water(water_utm)
+
+    if buildings_utm is not None and len(buildings_utm) > 0:
+        log.info(f"Loaded {len(buildings_utm)} OSM buildings.")
+
+    if USE_OVERTURE_BUILDINGS:
+        overture_wgs = fetch_overture_buildings(bbox)
+        if overture_wgs is not None and len(overture_wgs) > 0:
+            buildings_utm = merge_building_sources(
+                buildings_utm, overture_wgs,
+                dedup_radius_m=OVERTURE_DEDUP_RADIUS_M,
+            )
+        else:
+            log.info("Overture buildings: none fetched — using OSM only.")
+
+    if buildings_utm is not None and len(buildings_utm) > 0:
+        log.info(f"Total buildings for penalty layer: {len(buildings_utm)}")
+
+    # ── 4. Slope + curvature ───────────────────────────────────────────────
+    log.info("Computing slope and curvature …")
+    slope_pct, nodata_mask, curvature = compute_slope(dem, RESOLUTION)
+    log.info(
+        f"Slope: max={slope_pct.max():.1f}%, "
+        f"cells>{SLOPE_MAX_PCT}%: {np.sum(slope_pct > SLOPE_MAX_PCT):,}"
+    )
     def to_utm(gdf):
         if gdf is None or len(gdf) == 0:
             return gdf
@@ -256,13 +566,13 @@ def main():
         if custom_water_wgs is not None and len(custom_water_wgs) > 0:
             custom_water_utm = to_utm(custom_water_wgs)
             import pandas as pd
-            
+        
             # Add a natural="water" tag so it passes filter_bridge_worthy_water
             if "natural" not in custom_water_utm.columns:
                 custom_water_utm["natural"] = "water"
             else:
                 custom_water_utm["natural"] = custom_water_utm["natural"].fillna("water")
-                
+            
             if water_utm is None or len(water_utm) == 0:
                 water_utm = custom_water_utm
             else:
@@ -278,13 +588,13 @@ def main():
         dam_lake_wgs = fetch_dam_lake(bbox)
         if dam_lake_wgs is not None and len(dam_lake_wgs) > 0:
             dam_lake_utm = to_utm(dam_lake_wgs)
-            
+        
             # Apply geometric buffer for structural avoidance
             if DAM_LAKE_BUFFER_M > 0:
                 # Store original for export or visuals if needed, buffer the active geometry
                 dam_lake_utm["geometry"] = dam_lake_utm.geometry.buffer(DAM_LAKE_BUFFER_M)
                 log.info(f"Dam/Lake: Buffered exclusion zones by {DAM_LAKE_BUFFER_M} m.")
-            
+        
             exclusion_gdf_utm = dam_lake_utm
             log.info(f"Dam/Lake: Registered {len(exclusion_gdf_utm)} strictly avoided geometries.")
         else:
@@ -322,21 +632,54 @@ def main():
 
     # ── 4b. A→B bearing (for anisotropic sidehill cost) ───────────────────
     # Removed global bearing sidehill logic as per Phase 5.1 audit.
-    
+
     # ── 5. Rasterise vector layers — merge with DEM stream fallback if needed ─
     log.info("Rasterising exclusion zones and environmental layers …")
-    
+
+    # Phase 14.5: Intermediate raster cache for expensive products
+    rcache = RasterCache()
+
     # Phase 5.2: Buildings now use an area-based concentric penalty map
     building_penalty_map = np.zeros((rows, cols), dtype=np.float32)
     if buildings_utm is not None and len(buildings_utm) > 0:
         log.info(f"Applying building penalties to {len(buildings_utm)} buildings...")
-        from cost_surface import _apply_building_penalties
-        building_penalty_map = _apply_building_penalties(buildings_utm, transform, (rows, cols), RESOLUTION)
+        # Phase 14.5: Check raster cache first
+        bldg_fp = _cache_fingerprint(
+            len(buildings_utm), (rows, cols),
+            BUILDING_BASE_PENALTY, BUILDING_AREA_MULT, ROW_BUFFER_M_CFG, RESOLUTION,
+        )
+        cached_bldg, bldg_hit = rcache.get("building_penalty", bldg_fp, shape=(rows, cols))
+        if bldg_hit:
+            building_penalty_map = cached_bldg.astype(np.float32)
+        else:
+            from cost_surface import _apply_building_penalties
+            building_penalty_map = _apply_building_penalties(buildings_utm, transform, (rows, cols), RESOLUTION)
+            rcache.put("building_penalty", bldg_fp, building_penalty_map, transform)
 
-    log.info("Rasterising water_mask...")
-    water_mask    = rasterise_layer(water_utm,     transform, (rows, cols))
-    log.info("Rasterising roads_mask...")
-    roads_mask    = rasterise_layer(roads_utm,     transform, (rows, cols))
+    # Phase 14.5: Cache water and roads masks too
+    water_fp = _cache_fingerprint(
+        len(water_utm) if water_utm is not None else 0, (rows, cols)
+    )
+    cached_water, water_hit = rcache.get("water_mask", water_fp, shape=(rows, cols))
+    if water_hit:
+        log.info("Water mask loaded from raster cache.")
+        water_mask = cached_water.astype(np.float32)
+    else:
+        log.info("Rasterising water_mask...")
+        water_mask = rasterise_layer(water_utm, transform, (rows, cols))
+        rcache.put("water_mask", water_fp, water_mask, transform)
+
+    roads_fp = _cache_fingerprint(
+        len(roads_utm) if roads_utm is not None else 0, (rows, cols)
+    )
+    cached_roads, roads_hit = rcache.get("roads_mask", roads_fp, shape=(rows, cols))
+    if roads_hit:
+        log.info("Roads mask loaded from raster cache.")
+        roads_mask = cached_roads.astype(np.float32)
+    else:
+        log.info("Rasterising roads_mask...")
+        roads_mask = rasterise_layer(roads_utm, transform, (rows, cols))
+        rcache.put("roads_mask", roads_fp, roads_mask, transform)
     
     # ── 5b. Phase 11: LULC source selection (WorldCover + OSM blend) ──────
     # Fix IX: WorldCover is satellite-derived (wall-to-wall vegetation class)
@@ -388,7 +731,6 @@ def main():
 
     log.info(f"LULC penalty source: {lulc_source}")
 
-
     # Phase 3: if OSM water is sparse, derive stream network from DEM
     if osm_stats.get('dem_stream_fallback'):
         log.info("Deriving stream network from DEM (OSM water fallback active) …")
@@ -398,7 +740,7 @@ def main():
         n_stream_cells = int((water_mask > 0).sum())
         log.info(f"Combined water mask: {n_stream_cells:,} cells "
                  f"(OSM={osm_stats['water']} + DEM-derived)")
-                 
+             
         # Fix 17: Removed dead-code duplicate vectorisation loop.
         # Only the polygon-based approach (below) successfully appends to dem_water_gdf.
         from rasterio.features import shapes
@@ -509,65 +851,9 @@ def main():
         except Exception as exc:
             log.warning(f"Could not save intermediate GeoTIFFs: {exc}")
 
-    # ── 7. Grid indices for endpoints ─────────────────────────────────────
-    xa, ya = wgs84_to_utm(*POINT_A)
-    xb, yb = wgs84_to_utm(*POINT_B)
-    start_rc = xy_to_rowcol(xa, ya, transform)
-    end_rc   = xy_to_rowcol(xb, yb, transform)
-
-    b = BORDER_CELLS
-    start_rc = (
-        max(b, min(rows - 1 - b, start_rc[0])),
-        max(b, min(cols - 1 - b, start_rc[1])),
-    )
-    end_rc = (
-        max(b, min(rows - 1 - b, end_rc[0])),
-        max(b, min(cols - 1 - b, end_rc[1])),
-    )
-    log.info(f"Grid indices  A={start_rc}  B={end_rc}")
-
-    for label, rc in [("A", start_rc), ("B", end_rc)]:
-        if cost[rc] >= IMPASSABLE:
-            log.warning(
-                f"Point {label} at {rc} lands on impassable cell. "
-                f"Relaxing local 3×3 neighbourhood to cost=1."
-            )
-            r, c = rc
-            # Fix 18: Replace hard-coded cost=1.0 with neighbourhood-minimum floor.
-            # Setting cost = 1.0 made the entire 3×3 zone free, allowing Dijkstra to
-            # route a cost-free detour through the endpoint rather than finding the
-            # least-cost entry. Instead, use the 5th-percentile of valid neighbour costs
-            # so the endpoint is passable but no cheaper than the surrounding terrain.
-            r0, r1 = max(0, r - 1), min(rows, r + 2)
-            c0, c1 = max(0, c - 1), min(cols, c + 2)
-            neighbourhood = cost[r0:r1, c0:c1].copy()
-            valid_costs = neighbourhood[neighbourhood < IMPASSABLE]
-            floor_cost = float(np.percentile(valid_costs, 5)) if len(valid_costs) > 0 else 1.0
-            floor_cost = max(floor_cost, 1.0)
-            cost[r0:r1, c0:c1] = np.minimum(cost[r0:r1, c0:c1], floor_cost)
-
-    # ── 8. Multi-Scale LCP routing (Tang & Dou 2023) ─────────────────────────
-    # Generate the multi-resolution pyramid
-    timer.start("8.1_build_pyramid")
-    log.info(f"Building cost pyramid ({PYRAMID_LEVELS} levels, {DOWNSAMPLE_RATIO}:1 ratio, method={DOWNSAMPLE_METHOD})")
-    cost_pyramid = build_cost_pyramid(cost, PYRAMID_LEVELS, DOWNSAMPLE_RATIO, DOWNSAMPLE_METHOD)
-    timer.stop()
-
-    log.info("Running multi-scale segmented routing (MS-LCP) …")
-    timer.start("8.2_ms_lcp")
-    path_indices = multi_scale_lcp(
-        cost_pyramid, start_rc, end_rc, water_mask, transform,
-        resolution_m=RESOLUTION, dem=dem
-    )
-    timer.stop()
-
-    # Guard: empty path means routing failed completely
-    if not path_indices:
-        log.error("Routing returned an empty path — cannot continue.")
-        log.error("Check that start/end points are not inside impassable zones.")
-        sys.exit(1)
-
-    path_utm = [rowcol_to_xy(r, c, transform) for r, c in path_indices]
+    # ── 7. Map path_utm back to path_indices for downstream functions ──────
+    from geometry_utils import xy_to_rowcol
+    path_indices = [xy_to_rowcol(x, y, transform) for x, y in path_utm]
 
     # ── 9. Adaptive smoothing ──────────────────────────────────────────────
     log.info("Smoothing path (segment-aware B-spline) …")
@@ -594,6 +880,12 @@ def main():
                 f"Could not fully satisfy {min_radius:.0f} m curve-radius constraint. "
                 "Outputting best-effort geometry."
             )
+
+    # ── 10a. Map smoothed points back to leg segments via Nearest Neighbor ─
+    from scipy.spatial import cKDTree
+    tree = cKDTree(path_utm)
+    _, idx = tree.query(smooth_utm)
+    smooth_segment_indices = [segment_indices[i] for i in idx]
 
     # ── 10b. Phase 12: minimum tangent/curve length check ─────────────────
     design_lengths = verify_design_lengths(smooth_utm)
@@ -832,6 +1124,8 @@ def main():
             cost_result=cost_result,
             output_html=OUTPUT_REPORT_HTML,
             output_pdf=OUTPUT_REPORT_PDF,
+            waypoints=WAYPOINTS,
+            segment_indices=smooth_segment_indices,
         )
     except ImportError as exc:
         log.warning(f"Report generation skipped — {exc}")
@@ -928,6 +1222,8 @@ def main():
                 'route_rc': path_indices,
                 'route_utm': smooth_utm,
                 'route_wgs84': wgs84_coords,
+                'segment_indices': smooth_segment_indices,
+                'waypoints': WAYPOINTS,
                 'distances_m': dists_m,
                 'elevations_m': elevs_m,
                 'rc_distances_m': rc_dists,      # same length as route_rc

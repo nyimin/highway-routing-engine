@@ -65,6 +65,8 @@ def generate_report(
     output_html:  str = "output/feasibility_report.html",
     output_pdf:   str = "output/feasibility_report.pdf",
     *,
+    waypoints:    Optional[list] = None,
+    segment_indices: Optional[list] = None,
     point_a_label: str = "Point A",
     point_b_label: str = "Point B",
     project_title: str = "Myanmar Highway Alignment — Preliminary Feasibility",
@@ -158,6 +160,58 @@ def generate_report(
     profile_img_b64  = _img_to_b64("output/vertical_profile.png")
     earthwork_img_b64 = _img_to_b64("output/earthwork_masshual.png")
 
+    # ── Segment Breakdowns ────────────────────────────────────────────────
+    import numpy as np
+    segment_breakdowns = []
+    if waypoints is not None and segment_indices is not None and len(waypoints) > 2:
+        num_segments = len(waypoints) - 1
+        for i in range(num_segments):
+            seg_len_km = 0.0
+            if va_result is not None:
+                idx_in_seg = np.where(np.array(segment_indices) == i)[0]
+                if len(idx_in_seg) > 1:
+                    start_m = va_result.distances_m[idx_in_seg[0]]
+                    end_m   = va_result.distances_m[idx_in_seg[-1]]
+                    seg_len_km = (end_m - start_m) / 1000.0
+            
+            seg_cut_m3 = 0.0
+            seg_fill_m3 = 0.0
+            if ew_result is not None:
+                idx_in_seg = np.where(np.array(segment_indices[:-1]) == i)[0] 
+                if len(idx_in_seg) > 0:
+                    seg_cut_m3 = np.sum(ew_result.seg_cut_vol_m3[idx_in_seg])
+                    seg_fill_m3 = np.sum(ew_result.seg_fill_vol_m3[idx_in_seg])
+            
+            seg_bridge_count = 0
+            seg_bridge_cost = 0.0
+            if si_available:
+                seg_bridges = [s for s in structures if s.structure_type == "bridge" and getattr(s, "segment_index", 0) == i]
+                seg_bridge_count = len(seg_bridges)
+                seg_bridge_cost = sum(b.estimated_cost_usd for b in seg_bridges)
+            
+            seg_cost = 0.0
+            if cost_result is not None and cost_result.total_length_km > 0.0:
+                fraction = seg_len_km / cost_result.total_length_km
+                cost_exc_ew_bridges = cost_result.total_project_cost_usd - (
+                    cost_result.earthwork_cut_usd + cost_result.earthwork_fill_usd + cost_result.bridges_usd
+                )
+                
+                seg_ew_cut_cost = cost_result.earthwork_cut_usd * (seg_cut_m3 / ew_result.total_cut_m3) if ew_result and ew_result.total_cut_m3 > 0 else 0.0
+                seg_ew_fill_cost = cost_result.earthwork_fill_usd * (seg_fill_m3 / ew_result.total_fill_m3) if ew_result and ew_result.total_fill_m3 > 0 else 0.0
+                
+                seg_ew_cost = seg_ew_cut_cost + seg_ew_fill_cost
+                seg_cost = (cost_exc_ew_bridges * fraction) + seg_ew_cost + seg_bridge_cost
+
+            segment_breakdowns.append({
+                "index": i + 1,
+                "name": f"Leg {i+1}",
+                "length_km": round(seg_len_km, 1),
+                "cut_Mm3": round(seg_cut_m3 / 1e6, 2),
+                "fill_Mm3": round(seg_fill_m3 / 1e6, 2),
+                "bridges": seg_bridge_count,
+                "cost_M": round(seg_cost / 1e6, 1),
+            })
+
     # ── Render ────────────────────────────────────────────────────────────
     html_str = template.render(
         project_title     = project_title,
@@ -202,6 +256,8 @@ def generate_report(
         cost              = cost_result,
         total_cost_m      = total_cost_m,
         cost_per_km_m     = cost_per_km_m,
+        # Multi-Waypoint
+        segment_breakdowns = segment_breakdowns,
     )
 
     # ── Write HTML ────────────────────────────────────────────────────────

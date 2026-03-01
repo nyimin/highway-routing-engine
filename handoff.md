@@ -1,4 +1,4 @@
-# Highway Alignment Generator — Handoff Document (Phase 14.3 Complete)
+# Highway Alignment Generator — Handoff Document (Phase 16 Complete)
 
 ## Current State
 
@@ -6,62 +6,65 @@ The pipeline runs end-to-end on real Myanmar terrain (SRTM 30 m DEM, 373 K OSM
 buildings, 10 K+ river components) and produces a **276 km alignment** with zero
 curve-radius or grade violations. Exit code 0, peak memory ~2.9 GB on 8 GB RAM.
 
-**Phases 6–14 have been added**, implementing a full 3D vertical design profile,
-earthwork volumetrics, a bridge/culvert structure inventory, a parametric cost model, automated feasibility reports, minimum design lengths constraints, earthwork proxy awareness, continuous multi-bridge routing, the Tang & Dou (2023) MS-LCP progressive routing algorithm, and terrain-adaptive geometric smoothing.
+**Phases 6–17 have been added**, implementing a full 3D vertical design profile,
+earthwork volumetrics, a bridge/culvert structure inventory, a parametric cost model, automated feasibility reports, minimum design lengths constraints, earthwork proxy awareness, continuous multi-bridge routing, the Tang & Dou (2023) MS-LCP progressive routing algorithm, terrain-adaptive geometric smoothing, and constraint-first bridge scouting for hydrology integration.
 
 ---
 
 ## Phase History
 
-| Phase    | Scope                                                                                                             |
-| -------- | ----------------------------------------------------------------------------------------------------------------- |
-| 1–2      | DEM fetch (OpenTopography fallback chain), basic slope cost, OSM buildings/water                                  |
-| 3        | D8 flow-accumulation stream fallback when OSM water is sparse                                                     |
-| 4        | Two-resolution coarse-to-fine routing, corridor band masking, FMM/Dijkstra engine                                 |
-| 5.0      | Numba JIT (`try_jit`), vectorised flow-accumulation, `tracemalloc`, auto `COARSE_FACTOR`                          |
-| 5.1      | LULC environmental multipliers, road discount, 5-tier river hierarchy with bridge siting                          |
-| 5.2      | Area-based building penalties with EDT distance-decay, chunked rasterization                                      |
-| 5.3      | Routing polish, 12-product visualization suite, stability audit                                                   |
-| 5.4      | Class-based road discounts, expanded LULC table (18 categories), OSM data mitigations                             |
-| **6**    | **Vertical alignment — grade-clipping FGL, parabolic VCs, 3D GeoJSON export**                                     |
-| **7**    | **Earthwork volumes — trapezoidal AEA, Brückner mass-haul, CSV export**                                           |
-| **8**    | **Bridge & culvert inventory — geometric crossing detection, D8 culvert siting**                                  |
-| **9**    | **Parametric Cost Model — aggregate all cost components into USD breakdown (Supports 8-Lane Expressway scale)**   |
-| **10**   | **Automated Feasibility Report — Jinja2 HTML → PDF (with WeasyPrint)**                                            |
-| **11**   | **Earthwork Proxy — route pathfinding accounts for local terrain relief volumes**                                 |
-| **12**   | **Design Validations — enforces minimum geometric lengths for curves and tangents**                               |
-| **13**   | **Multi-Bridge Support — continuous pathfinding sequences through N identified bridges**                          |
-| **14**   | **MS-LCP Optimization — Tang & Dou (2023) progressive pyramid & parallel segmented routing**                      |
-| **14.1** | **Geometric Refinement — Segment-aware weighted B-splines for terrain-adaptive smoothing**                        |
-| **14.2** | **Custom Water Integration — High-fidelity GeoPackage polygon rivers replacing OSM LineStrings**                  |
-| **14.3** | **Dam & Reservoir Avoidance — Absolute routing exclusion buffers around critical waterbodies**                    |
-| **14.4** | **Routing Logic Corrections — Fixed multiplicative/additive water penalties, resolving coastal detour anomalies** |
+| Phase    | Scope                                                                                                                 |
+| -------- | --------------------------------------------------------------------------------------------------------------------- |
+| 1–2      | DEM fetch (OpenTopography fallback chain), basic slope cost, OSM buildings/water                                      |
+| 3        | D8 flow-accumulation stream fallback when OSM water is sparse                                                         |
+| 4        | Two-resolution coarse-to-fine routing, corridor band masking, FMM/Dijkstra engine                                     |
+| 5.0      | Numba JIT (`try_jit`), vectorised flow-accumulation, `tracemalloc`, auto `COARSE_FACTOR`                              |
+| 5.1      | LULC environmental multipliers, road discount, 5-tier river hierarchy with bridge siting                              |
+| 5.2      | Area-based building penalties with EDT distance-decay, chunked rasterization                                          |
+| 5.3      | Routing polish, 12-product visualization suite, stability audit                                                       |
+| 5.4      | Class-based road discounts, expanded LULC table (18 categories), OSM data mitigations                                 |
+| **6**    | **Vertical alignment — grade-clipping FGL, parabolic VCs, 3D GeoJSON export**                                         |
+| **7**    | **Earthwork volumes — trapezoidal AEA, Brückner mass-haul, CSV export**                                               |
+| **8**    | **Bridge & culvert inventory — geometric crossing detection, D8 culvert siting**                                      |
+| **9**    | **Parametric Cost Model — aggregate all cost components into USD breakdown (Supports 8-Lane Expressway scale)**       |
+| **10**   | **Automated Feasibility Report — Jinja2 HTML → PDF (with WeasyPrint)**                                                |
+| **11**   | **Earthwork Proxy — route pathfinding accounts for local terrain relief volumes**                                     |
+| **12**   | **Design Validations — enforces minimum geometric lengths for curves and tangents**                                   |
+| **13**   | **Multi-Bridge Support — continuous pathfinding sequences through N identified bridges**                              |
+| **14**   | **MS-LCP Optimization — Tang & Dou (2023) progressive pyramid & parallel segmented routing**                          |
+| **14.1** | **Geometric Refinement — Segment-aware weighted B-splines for terrain-adaptive smoothing**                            |
+| **14.2** | **Custom Water Integration — High-fidelity GeoPackage polygon rivers replacing OSM LineStrings**                      |
+| **14.3** | **Dam & Reservoir Avoidance — Absolute routing exclusion buffers around critical waterbodies**                        |
+| **14.4** | **Routing Logic Corrections — Fixed multiplicative/additive water penalties, resolving coastal detour anomalies**     |
+| **15**   | **Tile Routing — Memory-optimized corridor partitioning for long-distance routes (> 150 km)**                         |
+| **16**   | **Multi-Waypoint Routing — Sequential leg processing with segment-aware reporting and visualization**                 |
+| **17**   | **Constraint-First Bridge Scouting — Downsampled pre-routing to find optimal crossing axes over `IMPASSABLE` rivers** |
 
 ---
 
 ## File Structure
 
-| File                         | Responsibility                                                                    |
-| ---------------------------- | --------------------------------------------------------------------------------- |
-| `main.py`                    | Orchestrator — steps 12b (VA), 12c (earthwork), 12d (structures)                  |
-| `config.py`                  | All constants for Phases 1–8 (see Phase 6/7/8 sections at bottom)                 |
-| `data_fetch.py`              | DEM download, OSM Overpass queries, D8 stream derivation                          |
-| `cost_surface.py`            | Multi-layer cost raster: slope, water, buildings (EDT), LULC, roads               |
-| `routing.py`                 | Tang & Dou MS-LCP, FMM gradient descent, bridge siting, waypoint geometry filters |
-| `geometry_utils.py`          | Coordinate transforms, B-spline smoothing, curve/grade checks, 2D + 3D GeoJSON    |
-| `vertical_alignment.py`      | Grade-clipping FGL, parabolic VC fitting, AASHTO K-values, SSD check              |
-| `earthwork.py`               | Trapezoidal cross-sections, AEA volumes, Brückner mass-haul, balance points       |
-| `structures.py`              | Bridge crossing detection (Shapely), culvert siting (D8), cost estimation         |
-| `cost_model.py`              | Parametric cost model aggregating earthwork, structures, land, and project costs  |
-| `report.py`                  | Feasibility report generator (Jinja2 + WeasyPrint HTML/PDF export)                |
-| `templates/report.html`      | Jinja2 template file for the feasibility report                                   |
-| `visualize_route.py`         | 12-product suite (plots 11 + 12 respectively for VA and earthwork)                |
-| `jit_utils.py`               | `try_jit` Numba wrapper with CPU fallback                                         |
-| `test_vertical_alignment.py` | 7 deterministic tests — Phase 6                                                   |
-| `test_earthwork.py`          | 7 deterministic tests — Phase 7                                                   |
-| `test_structures.py`         | 7 deterministic tests — Phase 8                                                   |
-| `test_cost_model.py`         | 7 deterministic tests — Phase 9                                                   |
-| `test_report.py`             | 7 deterministic tests — Phase 10                                                  |
+| File                         | Responsibility                                                                     |
+| ---------------------------- | ---------------------------------------------------------------------------------- |
+| `main.py`                    | Orchestrator — steps 12b (VA), 12c (earthwork), 12d (structures)                   |
+| `config.py`                  | All constants for Phases 1–8 (see Phase 6/7/8 sections at bottom)                  |
+| `data_fetch.py`              | DEM download, OSM Overpass queries, D8 stream derivation                           |
+| `cost_surface.py`            | Multi-layer cost raster: slope, water, buildings (EDT), LULC, roads                |
+| `routing.py`                 | Tang & Dou MS-LCP, Constraint-First Bridge Scouting, FMM gradient descent, filters |
+| `geometry_utils.py`          | Coordinate transforms, B-spline smoothing, curve/grade checks, 2D + 3D GeoJSON     |
+| `vertical_alignment.py`      | Grade-clipping FGL, parabolic VC fitting, AASHTO K-values, SSD check               |
+| `earthwork.py`               | Trapezoidal cross-sections, AEA volumes, Brückner mass-haul, balance points        |
+| `structures.py`              | Bridge crossing detection (Shapely), culvert siting (D8), cost estimation          |
+| `cost_model.py`              | Parametric cost model aggregating earthwork, structures, land, and project costs   |
+| `report.py`                  | Feasibility report generator (Jinja2 + WeasyPrint HTML/PDF export)                 |
+| `templates/report.html`      | Jinja2 template file for the feasibility report                                    |
+| `visualize_route.py`         | 12-product suite (plots 11 + 12 respectively for VA and earthwork)                 |
+| `jit_utils.py`               | `try_jit` Numba wrapper with CPU fallback                                          |
+| `test_vertical_alignment.py` | 7 deterministic tests — Phase 6                                                    |
+| `test_earthwork.py`          | 7 deterministic tests — Phase 7                                                    |
+| `test_structures.py`         | 7 deterministic tests — Phase 8                                                    |
+| `test_cost_model.py`         | 7 deterministic tests — Phase 9                                                    |
+| `test_report.py`             | 7 deterministic tests — Phase 10                                                   |
 
 ---
 
@@ -74,9 +77,10 @@ earthwork volumetrics, a bridge/culvert structure inventory, a parametric cost m
 4  slope + curvature — compute_slope (numpy gradient)
 5  rasterise layers  — building EDT penalty, water_mask, roads_mask, lulc_penalty
 6  cost surface      — build_cost_surface (slope × water × building × LULC × road)
-7  grid endpoints    — A, B → (row, col) clamped to border
-8  routing           — build_cost_pyramid → multi_scale_lcp → path_indices
-9  smooth path       — segment-aware B-spline → smooth_utm (500 pts)
+7  grid endpoints    — A → B → C sequence of (row, col) coordinates
+8  routing           — sequential loop over waypoint pairs (TILE vs MONOLITHIC dispatch)
+9  stitch paths      — concatenate paths and build `segment_indices` array
+10 smooth path       — segment-aware B-spline → smooth_utm (500 pts)
 10 verify geometry   — curve_radius, row_setback, sustained_grade, clothoids
 11 extract profile   — longitudinal elevation + slope arrays
 12a VA input check   — guard: va_result = None if data insufficient
@@ -243,18 +247,18 @@ OUTPUT_COST_CSV             = "output/cost_estimate.csv"
 
 ---
 
-## Smoke-Test Baseline (Phase 14.3)
+## Smoke-Test Baseline (Phase 17.0)
 
-| Metric             | Value                          |
-| ------------------ | ------------------------------ |
-| Total length       | 276.6 km                       |
-| Min curve radius   | 239.4 m (≥150 m ✓)             |
-| Curve violations   | 0                              |
-| Grade violations   | 0                              |
-| Peak memory        | ~2.9 GB                        |
-| DEM source         | SRTMGL1, HIGH                  |
-| Viz products       | 12                             |
-| Unit tests passing | 35/35 (7 per phase 6/7/8/9/10) |
+| Metric             | Value                             |
+| ------------------ | --------------------------------- |
+| Total length       | 603.0 km (Multi-Waypoint, 3 Legs) |
+| Min curve radius   | 213.9 m (≥150 m ✓)                |
+| Curve violations   | 0                                 |
+| Grade violations   | 0                                 |
+| Peak memory        | ~4.3 GB                           |
+| DEM source         | SRTMGL1, HIGH                     |
+| Viz products       | 10                                |
+| Unit tests passing | 35/35 (7 per phase 6/7/8/9/10)    |
 
 ---
 
@@ -270,12 +274,11 @@ OUTPUT_COST_CSV             = "output/cost_estimate.csv"
 
 | Phase | Scope                                  |
 | ----- | -------------------------------------- |
-| 15    | Tile routing for > 500 km corridors    |
-| 16    | Streamlit/Gradio interactive dashboard |
+| 18    | Streamlit/Gradio interactive dashboard |
 
-### Immediate Next Step: Tile Routing for Long Corridors
+### Immediate Next Step: Streamlit Dashboard Optimization
 
-**Goal:** Implement a tiling system to chunk routing operations for corridors exceeding 500 km, optimizing memory usage and processing time by dynamically loading and discarding segment data as the route progresses.
+**Goal:** Implement a real-time interactive dashboard to visualize cost surfaces and route metrics dynamically, allowing for rapid A/B testing of different waypoint configurations.
 
 ---
 

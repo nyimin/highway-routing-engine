@@ -489,7 +489,8 @@ def _plot_dashboard(meta, slope_along_route, thresholds):
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _plot_folium_map(route_wgs84, slope_along_route, meta, thresholds,
-                     buildings_wgs=None, water_wgs=None, si_result=None):
+                     buildings_wgs=None, water_wgs=None, si_result=None,
+                     segment_indices=None, waypoints=None):
     log.info("Viz [10/10]: Interactive Folium map …")
     try:
         import folium
@@ -559,6 +560,35 @@ def _plot_folium_map(route_wgs84, slope_along_route, meta, thresholds,
         opacity=0.85
     ).add_to(route_fg)
     route_fg.add_to(m)
+
+    # ── Segment Overlays ─────────────────────
+    if segment_indices is not None and waypoints is not None and len(waypoints) > 2:
+        seg_fg = folium.FeatureGroup(name="Route Segments", show=True)
+        num_segments = len(waypoints) - 1
+        colors = ["#3388ff", "#ff3388", "#33ff88", "#8833ff", "#ff8833"]
+        segment_indices_arr = np.array(segment_indices)
+        for i in range(num_segments):
+            seg_mask = segment_indices_arr == i
+            if not np.any(seg_mask): continue
+            
+            seg_coords = [ [p[1], p[0]] for j, p in enumerate(route_wgs84) if seg_mask[j] ]
+            
+            color = colors[i % len(colors)]
+            folium.PolyLine(
+                locations=seg_coords,
+                color=color, 
+                weight=12,
+                opacity=0.3, 
+                tooltip=f"Leg {i+1}",
+            ).add_to(seg_fg)
+            
+            if i < num_segments - 1:
+                wp = waypoints[i+1]
+                folium.Marker(
+                    [wp[1], wp[0]], popup=f"Waypoint {i+1}",
+                    icon=folium.Icon(color="orange", icon="flag")
+                ).add_to(m)
+        seg_fg.add_to(m)
 
     # Start/End markers
     start = route_wgs84[0]
@@ -1063,6 +1093,8 @@ def generate_all_visuals(viz_data):
             buildings_wgs=viz_data.get("buildings_wgs"),
             water_wgs=viz_data.get("water_wgs"),
             si_result=viz_data.get("si_result"),
+            segment_indices=viz_data.get("segment_indices"),
+            waypoints=viz_data.get("waypoints"),
         )
     except Exception as e:
         log.warning(f"Viz [10] folium map failed: {e}")

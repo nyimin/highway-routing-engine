@@ -53,6 +53,7 @@ class Structure:
     """A single bridge or culvert along the alignment."""
     structure_id: int
     structure_type: str          # 'bridge' or 'culvert'
+    segment_index: int           # The multi-waypoint leg index (0=A->B, 1=B->C)
     chainage_m: float            # mid-point chainage along alignment
     chainage_start_m: float      # start of structure
     chainage_end_m: float        # end of structure
@@ -539,6 +540,7 @@ def build_structure_inventory(
     flow_accum=None,
     transform=None,
     path_indices=None,
+    smooth_segment_indices=None,
     bridge_freeboard_m: float     = 1.5,
     bridge_cost_per_m2_usd: float = 3_500.0,
     bridge_width_m: float         = 12.0,
@@ -604,12 +606,19 @@ def build_structure_inventory(
         # Freeboard is enforced in Phase 6 z_design. Deck elevation IS z_design.
         deck_elev = _z_at(mid_s, va_result) 
         lon, lat  = _utm_chainage_to_wgs84(mid_s, smooth_utm, va_result)
+
+        seg_idx = 0
+        if smooth_segment_indices is not None and va_result is not None:
+            s_idx = np.searchsorted(va_result.distances_m, mid_s)
+            s_idx = min(len(va_result.distances_m) - 1, s_idx)
+            seg_idx = smooth_segment_indices[s_idx]
         
         # Re-classify minor crossings as culverts based on RAW span
         if cr["length_m"] < BRIDGE_MIN_SPAN_M:
             structures.append(Structure(
                 structure_id      = i + 1,
                 structure_type    = "culvert", # Major Box Culvert
+                segment_index     = seg_idx,
                 chainage_m        = mid_s,
                 chainage_start_m  = mid_s, # Culverts don't have span representations in output
                 chainage_end_m    = mid_s,
@@ -633,6 +642,7 @@ def build_structure_inventory(
         structures.append(Structure(
             structure_id      = i + 1,
             structure_type    = "bridge",
+            segment_index     = seg_idx,
             chainage_m        = mid_s,
             chainage_start_m  = cr["start_m"],
             chainage_end_m    = cr["end_m"],

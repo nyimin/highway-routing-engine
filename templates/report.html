@@ -257,647 +257,696 @@
         padding-top: 10px;
         border-top: 1px solid #e0e0e0;
       }
+
+      /* ── Container for HTML Browser View ────────────── */
+      .container {
+        max-width: 900px;
+        margin: 0 auto;
+        padding: 0 40px;
+      }
     </style>
   </head>
   <body>
-    <!-- ══════════════════════════════════════════════════════ -->
-    <!-- COVER PAGE                                             -->
-    <!-- ══════════════════════════════════════════════════════ -->
-    <div class="cover">
-      <div class="logo-bar">
-        Highway Alignment Generator · Myanmar Preliminary Feasibility
+    <div class="container">
+      <!-- ══════════════════════════════════════════════════════ -->
+      <!-- COVER PAGE                                             -->
+      <!-- ══════════════════════════════════════════════════════ -->
+      <div class="cover">
+        <div class="logo-bar">
+          Highway Alignment Generator · Myanmar Preliminary Feasibility
+        </div>
+        <h1>{{ project_title }}</h1>
+        <h2>{{ point_a_label }} → {{ point_b_label }}</h2>
+
+        <dl class="meta-grid">
+          <dt>Route Length</dt>
+          <dd>{{ "%.1f"|format(total_length_km) }} km</dd>
+          <dt>Report Date</dt>
+          <dd>{{ report_date }}</dd>
+          <dt>Scenario</dt>
+          <dd>{{ scenario_profile|title }}</dd>
+          <dt>Design Speed</dt>
+          <dd>{{ design_speed_kmph }} km/h</dd>
+          <dt>Total Project Cost</dt>
+          <dd>USD {{ "%.1f"|format(total_cost_m) }} M</dd>
+          <dt>Cost per km</dt>
+          <dd>USD {{ "%.2f"|format(cost_per_km_m) }} M/km</dd>
+        </dl>
+
+        <div class="disclaimer">
+          ⚠ PRELIMINARY — NOT FOR CONSTRUCTION — ±25–30% ACCURACY
+        </div>
       </div>
-      <h1>{{ project_title }}</h1>
-      <h2>{{ point_a_label }} → {{ point_b_label }}</h2>
+      <div class="page-break"></div>
 
-      <dl class="meta-grid">
-        <dt>Route Length</dt>
-        <dd>{{ "%.1f"|format(total_length_km) }} km</dd>
-        <dt>Report Date</dt>
-        <dd>{{ report_date }}</dd>
-        <dt>Scenario</dt>
-        <dd>{{ scenario_profile|title }}</dd>
-        <dt>Design Speed</dt>
-        <dd>{{ design_speed_kmph }} km/h</dd>
-        <dt>Total Project Cost</dt>
-        <dd>USD {{ "%.1f"|format(total_cost_m) }} M</dd>
-        <dt>Cost per km</dt>
-        <dd>USD {{ "%.2f"|format(cost_per_km_m) }} M/km</dd>
-      </dl>
+      <!-- ══════════════════════════════════════════════════════ -->
+      <!-- SECTION 1: EXECUTIVE SUMMARY                          -->
+      <!-- ══════════════════════════════════════════════════════ -->
+      <h2 class="section-title">1. Executive Summary</h2>
 
-      <div class="disclaimer">
-        ⚠ PRELIMINARY — NOT FOR CONSTRUCTION — ±25–30% ACCURACY
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="label">Total Length</div>
+          <div class="value">{{ "%.1f"|format(total_length_km) }}</div>
+          <div class="unit">km</div>
+        </div>
+        <div class="metric-card">
+          <div class="label">Total Project Cost</div>
+          <div class="value">USD {{ "%.1f"|format(total_cost_m) }} M</div>
+          <div class="unit">preliminary ±25–30%</div>
+        </div>
+        <div class="metric-card">
+          <div class="label">Cost per km</div>
+          <div class="value">USD {{ "%.2f"|format(cost_per_km_m) }} M</div>
+          <div class="unit">per route-km</div>
+        </div>
+        <div class="metric-card">
+          <div class="label">Max Grade</div>
+          <div class="value">{{ max_grade }}%</div>
+          <div class="unit">design FGL</div>
+        </div>
+        <div class="metric-card">
+          <div class="label">Bridges</div>
+          <div class="value">{{ bridge_count }}</div>
+          <div class="unit">structures</div>
+        </div>
       </div>
-    </div>
-    <div class="page-break"></div>
 
-    <!-- ══════════════════════════════════════════════════════ -->
-    <!-- SECTION 1: EXECUTIVE SUMMARY                          -->
-    <!-- ══════════════════════════════════════════════════════ -->
-    <h2 class="section-title">1. Executive Summary</h2>
+      <table>
+        <thead>
+          <tr>
+            <th>Metric</th>
+            <th>Value</th>
+            <th>Notes</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Corridor</td>
+            <td>{{ point_a_label }} → {{ point_b_label }}</td>
+            <td>Myanmar</td>
+          </tr>
+          <tr>
+            <td>Route Length</td>
+            <td>{{ "%.1f"|format(total_length_km) }} km</td>
+            <td>Smoothed 3D alignment</td>
+          </tr>
+          <tr>
+            <td>Scenario Profile</td>
+            <td>{{ scenario_profile|replace("_"," ")|title }}</td>
+            <td>Myanmar DRD standard</td>
+          </tr>
+          <tr>
+            <td>DEM Source</td>
+            <td>{{ dem_source }}</td>
+            <td>SRTM 30 m</td>
+          </tr>
+          <tr>
+            <td>Max Slope (terrain)</td>
+            <td>{{ max_slope_pct }} %</td>
+            <td>Along route</td>
+          </tr>
+          <tr>
+            <td>Min Curve Radius</td>
+            <td>{{ min_curve_radius_m }} m</td>
+            <td>Geometric check ✓</td>
+          </tr>
+          <tr>
+            <td>Total Cut</td>
+            <td>{{ "%.2f"|format(total_cut_mm3) }} Mm³</td>
+            <td>Earthwork</td>
+          </tr>
+          <tr>
+            <td>Total Fill</td>
+            <td>{{ "%.2f"|format(total_fill_mm3) }} Mm³</td>
+            <td>Earthwork</td>
+          </tr>
+          <tr>
+            <td>Net Import</td>
+            <td>{{ "%.3f"|format(net_import_mm3) }} Mm³</td>
+            <td>&gt;0 = borrow required</td>
+          </tr>
+          <tr>
+            <td>Bridge Structures</td>
+            <td>{{ bridge_count }}</td>
+            <td>Total span: {{ "%.0f"|format(total_bridge_len_m) }} m</td>
+          </tr>
+        </tbody>
+      </table>
+      <div class="page-break"></div>
 
-    <div class="metrics-grid">
-      <div class="metric-card">
-        <div class="label">Total Length</div>
-        <div class="value">{{ "%.1f"|format(total_length_km) }}</div>
-        <div class="unit">km</div>
+      <!-- ══════════════════════════════════════════════════════ -->
+      <!-- SECTION 2: ROUTE DESCRIPTION                          -->
+      <!-- ══════════════════════════════════════════════════════ -->
+      <h2 class="section-title">2. Route Description</h2>
+
+      <p>
+        The alignment runs {{ "%.1f"|format(total_length_km) }} km between {{
+        point_a_label }} and {{ point_b_label }} in Myanmar. The route was
+        generated using a multi-layer cost surface combining SRTM terrain, OSM
+        buildings, water bodies, land use, and existing road infrastructure.
+        Two-resolution coarse-to-fine Dijkstra routing was applied, followed by
+        B-spline path smoothing and geometric verification (curve radius,
+        sustained gradient, clothoid transitions).
+      </p>
+
+      <h3 class="sub-title">Terrain Statistics</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Parameter</th>
+            <th>Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>DEM Source</td>
+            <td>{{ dem_source }}</td>
+          </tr>
+          <tr>
+            <td>DEM Resolution</td>
+            <td>30 m (SRTM)</td>
+          </tr>
+          <tr>
+            <td>Max Terrain Slope Along Route</td>
+            <td>{{ max_slope_pct }} %</td>
+          </tr>
+          <tr>
+            <td>Min Achieved Curve Radius</td>
+            <td>{{ min_curve_radius_m }} m</td>
+          </tr>
+          <tr>
+            <td>Grade Violations (FGL)</td>
+            <td>{{ grade_violations }}</td>
+          </tr>
+          <tr>
+            <td>Data Confidence</td>
+            <td>{{ data_confidence }}</td>
+          </tr>
+          {% if data_warnings %}
+          <tr>
+            <td>Data Warnings</td>
+            <td>{{ data_warnings|length }}</td>
+          </tr>
+          {% endif %}
+        </tbody>
+      </table>
+
+      {% if segment_breakdowns %}
+      <h3 class="sub-title">Segment Breakdown</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>Leg</th>
+            <th class="right">Length (km)</th>
+            <th class="right">Earthwork Cut (Mm³)</th>
+            <th class="right">Earthwork Fill (Mm³)</th>
+            <th class="right">Bridges</th>
+            <th class="right">Est. Civil Cost (USD M)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for seg in segment_breakdowns %}
+          <tr>
+            <td><strong>{{ seg.name }}</strong></td>
+            <td class="right">{{ "%.1f"|format(seg.length_km) }}</td>
+            <td class="right">{{ "%.2f"|format(seg.cut_Mm3) }}</td>
+            <td class="right">{{ "%.2f"|format(seg.fill_Mm3) }}</td>
+            <td class="right">{{ seg.bridges }}</td>
+            <td class="right">{{ "%.1f"|format(seg.cost_M) }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% endif %} {% if map_path %}
+      <div class="figure">
+        <img src="{{ map_path }}" alt="Route map" style="max-height: 320px" />
+        <figcaption>
+          Figure 1 — Interactive route map (see output/route_map.html for full
+          version)
+        </figcaption>
       </div>
-      <div class="metric-card">
-        <div class="label">Total Project Cost</div>
-        <div class="value">USD {{ "%.1f"|format(total_cost_m) }} M</div>
-        <div class="unit">preliminary ±25–30%</div>
+      {% endif %}
+      <div class="page-break"></div>
+
+      <!-- ══════════════════════════════════════════════════════ -->
+      <!-- SECTION 3: VERTICAL PROFILE                           -->
+      <!-- ══════════════════════════════════════════════════════ -->
+      <h2 class="section-title">3. Vertical Profile</h2>
+
+      {% if va_available %}
+      <p>
+        The vertical alignment was designed using a grade-clipping Finished
+        Grade Line (FGL) algorithm with parabolic vertical curves fitted at each
+        VPI. Design speed {{ design_speed_kmph }} km/h; max grade {{ max_grade
+        }} % ({{ scenario_profile|replace("_"," ")|title }} standard). {{
+        vc_count }} vertical curves were fitted; stopping sight distance (SSD)
+        checks were applied at each crest curve.
+      </p>
+
+      <table>
+        <thead>
+          <tr>
+            <th>Parameter</th>
+            <th>Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Vertical Curves (VCs)</td>
+            <td>{{ vc_count }}</td>
+          </tr>
+          <tr>
+            <td>Max Design Grade</td>
+            <td>{{ max_grade }} %</td>
+          </tr>
+          <tr>
+            <td>Grade Violations</td>
+            <td>{{ grade_violations }}</td>
+          </tr>
+          <tr>
+            <td>SSD Violations</td>
+            <td>{{ ssd_violations }}</td>
+          </tr>
+          <tr>
+            <td>Max Fill Depth</td>
+            <td>{{ max_fill_m }} m</td>
+          </tr>
+          <tr>
+            <td>Max Cut Depth</td>
+            <td>{{ max_cut_m }} m</td>
+          </tr>
+        </tbody>
+      </table>
+
+      {% if profile_img_b64 %}
+      <div class="figure">
+        <img
+          src="data:image/png;base64,{{ profile_img_b64 }}"
+          alt="Vertical profile"
+        />
+        <figcaption>
+          Figure 2 — Vertical profile: FGL vs terrain &amp; grade % (Phase 6)
+        </figcaption>
       </div>
-      <div class="metric-card">
-        <div class="label">Cost per km</div>
-        <div class="value">USD {{ "%.2f"|format(cost_per_km_m) }} M</div>
-        <div class="unit">per route-km</div>
+      {% else %}
+      <div class="callout">
+        Vertical profile image not available. Run the pipeline to generate
+        output/vertical_profile.png.
       </div>
-      <div class="metric-card">
-        <div class="label">Max Grade</div>
-        <div class="value">{{ max_grade }}%</div>
-        <div class="unit">design FGL</div>
+      {% endif %} {% else %}
+      <div class="callout">
+        Vertical alignment not computed (va_result unavailable).
       </div>
-      <div class="metric-card">
-        <div class="label">Bridges</div>
-        <div class="value">{{ bridge_count }}</div>
-        <div class="unit">structures</div>
+      {% endif %}
+      <div class="page-break"></div>
+
+      <!-- ══════════════════════════════════════════════════════ -->
+      <!-- SECTION 4: EARTHWORK SUMMARY                          -->
+      <!-- ══════════════════════════════════════════════════════ -->
+      <h2 class="section-title">4. Earthwork Summary</h2>
+
+      {% if ew_available %}
+      <table>
+        <thead>
+          <tr>
+            <th>Parameter</th>
+            <th>Value</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Formation Width</td>
+            <td>{{ formation_width_m }} m</td>
+          </tr>
+          <tr>
+            <td>Cut Batter Slope</td>
+            <td>1H : 1V</td>
+          </tr>
+          <tr>
+            <td>Fill Batter Slope</td>
+            <td>1.5H : 1V</td>
+          </tr>
+          <tr>
+            <td>Swell Factor</td>
+            <td>{{ swell_factor }}</td>
+          </tr>
+          <tr>
+            <td>Total Cut Volume</td>
+            <td>{{ "%.3f"|format(total_cut_mm3) }} Mm³</td>
+          </tr>
+          <tr>
+            <td>Total Fill Volume</td>
+            <td>{{ "%.3f"|format(total_fill_mm3) }} Mm³</td>
+          </tr>
+          <tr>
+            <td>Net {{ "Import" if net_import_mm3 > 0 else "Spoil" }}</td>
+            <td>{{ "%.3f"|format(net_import_mm3|abs) }} Mm³</td>
+          </tr>
+          <tr>
+            <td>Balance Points</td>
+            <td>{{ balance_points }}</td>
+          </tr>
+        </tbody>
+      </table>
+
+      {% if earthwork_img_b64 %}
+      <div class="figure">
+        <img
+          src="data:image/png;base64,{{ earthwork_img_b64 }}"
+          alt="Mass-haul diagram"
+        />
+        <figcaption>
+          Figure 3 — Earthwork: depth profile · cumulative volumes · Brückner
+          mass-haul (Phase 7)
+        </figcaption>
       </div>
-    </div>
+      {% else %}
+      <div class="callout">
+        Earthwork chart not available. Run the pipeline to generate
+        output/earthwork_masshual.png.
+      </div>
+      {% endif %} {% else %}
+      <div class="callout">
+        Earthwork data not available (ew_result is None).
+      </div>
+      {% endif %}
+      <div class="page-break"></div>
 
-    <table>
-      <thead>
-        <tr>
-          <th>Metric</th>
-          <th>Value</th>
-          <th>Notes</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>Corridor</td>
-          <td>{{ point_a_label }} → {{ point_b_label }}</td>
-          <td>Myanmar</td>
-        </tr>
-        <tr>
-          <td>Route Length</td>
-          <td>{{ "%.1f"|format(total_length_km) }} km</td>
-          <td>Smoothed 3D alignment</td>
-        </tr>
-        <tr>
-          <td>Scenario Profile</td>
-          <td>{{ scenario_profile|replace("_"," ")|title }}</td>
-          <td>Myanmar DRD standard</td>
-        </tr>
-        <tr>
-          <td>DEM Source</td>
-          <td>{{ dem_source }}</td>
-          <td>SRTM 30 m</td>
-        </tr>
-        <tr>
-          <td>Max Slope (terrain)</td>
-          <td>{{ max_slope_pct }} %</td>
-          <td>Along route</td>
-        </tr>
-        <tr>
-          <td>Min Curve Radius</td>
-          <td>{{ min_curve_radius_m }} m</td>
-          <td>Geometric check ✓</td>
-        </tr>
-        <tr>
-          <td>Total Cut</td>
-          <td>{{ "%.2f"|format(total_cut_mm3) }} Mm³</td>
-          <td>Earthwork</td>
-        </tr>
-        <tr>
-          <td>Total Fill</td>
-          <td>{{ "%.2f"|format(total_fill_mm3) }} Mm³</td>
-          <td>Earthwork</td>
-        </tr>
-        <tr>
-          <td>Net Import</td>
-          <td>{{ "%.3f"|format(net_import_mm3) }} Mm³</td>
-          <td>&gt;0 = borrow required</td>
-        </tr>
-        <tr>
-          <td>Bridge Structures</td>
-          <td>{{ bridge_count }}</td>
-          <td>Total span: {{ "%.0f"|format(total_bridge_len_m) }} m</td>
-        </tr>
-      </tbody>
-    </table>
-    <div class="page-break"></div>
+      <!-- ══════════════════════════════════════════════════════ -->
+      <!-- SECTION 5: STRUCTURE INVENTORY                        -->
+      <!-- ══════════════════════════════════════════════════════ -->
+      <h2 class="section-title">5. Structure Inventory</h2>
 
-    <!-- ══════════════════════════════════════════════════════ -->
-    <!-- SECTION 2: ROUTE DESCRIPTION                          -->
-    <!-- ══════════════════════════════════════════════════════ -->
-    <h2 class="section-title">2. Route Description</h2>
+      {% if si_available %}
+      <p>
+        {{ bridge_count }} bridge(s) were identified along the alignment using
+        Shapely water polygon intersection.
+      </p>
 
-    <p>
-      The alignment runs {{ "%.1f"|format(total_length_km) }} km between {{
-      point_a_label }} and {{ point_b_label }} in Myanmar. The route was
-      generated using a multi-layer cost surface combining SRTM terrain, OSM
-      buildings, water bodies, land use, and existing road infrastructure.
-      Two-resolution coarse-to-fine Dijkstra routing was applied, followed by
-      B-spline path smoothing and geometric verification (curve radius,
-      sustained gradient, clothoid transitions).
-    </p>
+      {% if structures %}
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Type</th>
+            <th>Chainage (km)</th>
+            <th>Span (m)</th>
+            <th>Deck Elev. (m)</th>
+            <th>Watercourse</th>
+            <th>Cost (USD)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for s in structures %}
+          <tr>
+            <td>{{ s.structure_id }}</td>
+            <td>{{ s.structure_type|title }}</td>
+            <td class="right">{{ "%.1f"|format(s.chainage_m / 1000) }}</td>
+            <td class="right">
+              {{ "%.0f"|format(s.length_m) if s.structure_type == "bridge" else
+              "—" }}
+            </td>
+            <td class="right">
+              {{ "%.1f"|format(s.deck_elevation_m) if s.structure_type ==
+              "bridge" else "—" }}
+            </td>
+            <td>{{ s.water_name }}</td>
+            <td class="right mono">
+              {{ "{:,.0f}".format(s.estimated_cost_usd) }}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+        <tfoot>
+          <tr>
+            <td colspan="6">TOTAL BRIDGE COST</td>
+            <td class="right mono">
+              {{ "{:,.0f}".format(total_bridge_cost_usd) }}
+            </td>
+          </tr>
+        </tfoot>
+      </table>
+      {% endif %} {% else %}
+      <div class="callout">
+        Structure inventory not available (si_result is None).
+      </div>
+      {% endif %}
+      <div class="page-break"></div>
 
-    <h3 class="sub-title">Terrain Statistics</h3>
-    <table>
-      <thead>
-        <tr>
-          <th>Parameter</th>
-          <th>Value</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>DEM Source</td>
-          <td>{{ dem_source }}</td>
-        </tr>
-        <tr>
-          <td>DEM Resolution</td>
-          <td>30 m (SRTM)</td>
-        </tr>
-        <tr>
-          <td>Max Terrain Slope Along Route</td>
-          <td>{{ max_slope_pct }} %</td>
-        </tr>
-        <tr>
-          <td>Min Achieved Curve Radius</td>
-          <td>{{ min_curve_radius_m }} m</td>
-        </tr>
-        <tr>
-          <td>Grade Violations (FGL)</td>
-          <td>{{ grade_violations }}</td>
-        </tr>
-        <tr>
-          <td>Data Confidence</td>
-          <td>{{ data_confidence }}</td>
-        </tr>
-        {% if data_warnings %}
-        <tr>
-          <td>Data Warnings</td>
-          <td>{{ data_warnings|length }}</td>
-        </tr>
-        {% endif %}
-      </tbody>
-    </table>
-
-    {% if map_path %}
-    <div class="figure">
-      <img src="{{ map_path }}" alt="Route map" style="max-height: 320px" />
-      <figcaption>
-        Figure 1 — Interactive route map (see output/route_map.html for full
-        version)
-      </figcaption>
-    </div>
-    {% endif %}
-    <div class="page-break"></div>
-
-    <!-- ══════════════════════════════════════════════════════ -->
-    <!-- SECTION 3: VERTICAL PROFILE                           -->
-    <!-- ══════════════════════════════════════════════════════ -->
-    <h2 class="section-title">3. Vertical Profile</h2>
-
-    {% if va_available %}
-    <p>
-      The vertical alignment was designed using a grade-clipping Finished Grade
-      Line (FGL) algorithm with parabolic vertical curves fitted at each VPI.
-      Design speed {{ design_speed_kmph }} km/h; max grade {{ max_grade }} % ({{
-      scenario_profile|replace("_"," ")|title }} standard). {{ vc_count }}
-      vertical curves were fitted; stopping sight distance (SSD) checks were
-      applied at each crest curve.
-    </p>
-
-    <table>
-      <thead>
-        <tr>
-          <th>Parameter</th>
-          <th>Value</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>Vertical Curves (VCs)</td>
-          <td>{{ vc_count }}</td>
-        </tr>
-        <tr>
-          <td>Max Design Grade</td>
-          <td>{{ max_grade }} %</td>
-        </tr>
-        <tr>
-          <td>Grade Violations</td>
-          <td>{{ grade_violations }}</td>
-        </tr>
-        <tr>
-          <td>SSD Violations</td>
-          <td>{{ ssd_violations }}</td>
-        </tr>
-        <tr>
-          <td>Max Fill Depth</td>
-          <td>{{ max_fill_m }} m</td>
-        </tr>
-        <tr>
-          <td>Max Cut Depth</td>
-          <td>{{ max_cut_m }} m</td>
-        </tr>
-      </tbody>
-    </table>
-
-    {% if profile_img_b64 %}
-    <div class="figure">
-      <img
-        src="data:image/png;base64,{{ profile_img_b64 }}"
-        alt="Vertical profile"
-      />
-      <figcaption>
-        Figure 2 — Vertical profile: FGL vs terrain &amp; grade % (Phase 6)
-      </figcaption>
-    </div>
-    {% else %}
-    <div class="callout">
-      Vertical profile image not available. Run the pipeline to generate
-      output/vertical_profile.png.
-    </div>
-    {% endif %} {% else %}
-    <div class="callout">
-      Vertical alignment not computed (va_result unavailable).
-    </div>
-    {% endif %}
-    <div class="page-break"></div>
-
-    <!-- ══════════════════════════════════════════════════════ -->
-    <!-- SECTION 4: EARTHWORK SUMMARY                          -->
-    <!-- ══════════════════════════════════════════════════════ -->
-    <h2 class="section-title">4. Earthwork Summary</h2>
-
-    {% if ew_available %}
-    <table>
-      <thead>
-        <tr>
-          <th>Parameter</th>
-          <th>Value</th>
-        </tr>
-      </thead>
-      <tbody>
-        <tr>
-          <td>Formation Width</td>
-          <td>{{ formation_width_m }} m</td>
-        </tr>
-        <tr>
-          <td>Cut Batter Slope</td>
-          <td>1H : 1V</td>
-        </tr>
-        <tr>
-          <td>Fill Batter Slope</td>
-          <td>1.5H : 1V</td>
-        </tr>
-        <tr>
-          <td>Swell Factor</td>
-          <td>{{ swell_factor }}</td>
-        </tr>
-        <tr>
-          <td>Total Cut Volume</td>
-          <td>{{ "%.3f"|format(total_cut_mm3) }} Mm³</td>
-        </tr>
-        <tr>
-          <td>Total Fill Volume</td>
-          <td>{{ "%.3f"|format(total_fill_mm3) }} Mm³</td>
-        </tr>
-        <tr>
-          <td>Net {{ "Import" if net_import_mm3 > 0 else "Spoil" }}</td>
-          <td>{{ "%.3f"|format(net_import_mm3|abs) }} Mm³</td>
-        </tr>
-        <tr>
-          <td>Balance Points</td>
-          <td>{{ balance_points }}</td>
-        </tr>
-      </tbody>
-    </table>
-
-    {% if earthwork_img_b64 %}
-    <div class="figure">
-      <img
-        src="data:image/png;base64,{{ earthwork_img_b64 }}"
-        alt="Mass-haul diagram"
-      />
-      <figcaption>
-        Figure 3 — Earthwork: depth profile · cumulative volumes · Brückner
-        mass-haul (Phase 7)
-      </figcaption>
-    </div>
-    {% else %}
-    <div class="callout">
-      Earthwork chart not available. Run the pipeline to generate
-      output/earthwork_masshual.png.
-    </div>
-    {% endif %} {% else %}
-    <div class="callout">Earthwork data not available (ew_result is None).</div>
-    {% endif %}
-    <div class="page-break"></div>
-
-    <!-- ══════════════════════════════════════════════════════ -->
-    <!-- SECTION 5: STRUCTURE INVENTORY                        -->
-    <!-- ══════════════════════════════════════════════════════ -->
-    <h2 class="section-title">5. Structure Inventory</h2>
-
-    {% if si_available %}
-    <p>
-      {{ bridge_count }} bridge(s) were identified along the alignment using
-      Shapely water polygon intersection.
-    </p>
-
-    {% if structures %}
-    <table>
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>Type</th>
-          <th>Chainage (km)</th>
-          <th>Span (m)</th>
-          <th>Deck Elev. (m)</th>
-          <th>Watercourse</th>
-          <th>Cost (USD)</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for s in structures %}
-        <tr>
-          <td>{{ s.structure_id }}</td>
-          <td>{{ s.structure_type|title }}</td>
-          <td class="right">{{ "%.1f"|format(s.chainage_m / 1000) }}</td>
-          <td class="right">
-            {{ "%.0f"|format(s.length_m) if s.structure_type == "bridge" else
-            "—" }}
-          </td>
-          <td class="right">
-            {{ "%.1f"|format(s.deck_elevation_m) if s.structure_type == "bridge"
-            else "—" }}
-          </td>
-          <td>{{ s.water_name }}</td>
-          <td class="right mono">
-            {{ "{:,.0f}".format(s.estimated_cost_usd) }}
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-      <tfoot>
-        <tr>
-          <td colspan="6">TOTAL BRIDGE COST</td>
-          <td class="right mono">
-            {{ "{:,.0f}".format(total_bridge_cost_usd) }}
-          </td>
-        </tr>
-      </tfoot>
-    </table>
-    {% endif %} {% else %}
-    <div class="callout">
-      Structure inventory not available (si_result is None).
-    </div>
-    {% endif %}
-    <div class="page-break"></div>
-
-    <!-- ══════════════════════════════════════════════════════ -->
-    <!-- SECTION 6: COST ESTIMATE                              -->
-    <!-- ══════════════════════════════════════════════════════ -->
-    <h2 class="section-title">6. Cost Estimate</h2>
-
-    {% if cost_available %}
-    <div class="callout">
-      All unit rates from Myanmar DRD schedule of rates and World Bank ROCKS
-      2020–2024. Accuracy ±25–30% at preliminary design stage.
-    </div>
-
-    <table>
-      <thead>
-        <tr>
-          <th>Cost Component</th>
-          <th class="right">Amount (USD)</th>
-          <th class="right">% of Total</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% set total = cost.total_project_cost_usd %}
-        <tr>
-          <td>
-            Earthwork — Cut Excavation (USD {{ cost.assumptions.cut_rate_usd_m3
-            }}/m³)
-          </td>
-          <td class="right mono">
-            {{ "{:,.0f}".format(cost.earthwork_cut_usd) }}
-          </td>
-          <td class="right">
-            {{ "%.1f"|format(100*cost.earthwork_cut_usd/total) }}%
-          </td>
-        </tr>
-        <tr>
-          <td>
-            Earthwork — Import Fill (USD {{ cost.assumptions.fill_rate_usd_m3
-            }}/m³)
-          </td>
-          <td class="right mono">
-            {{ "{:,.0f}".format(cost.earthwork_fill_usd) }}
-          </td>
-          <td class="right">
-            {{ "%.1f"|format(100*cost.earthwork_fill_usd/total) }}%
-          </td>
-        </tr>
-        <tr>
-          <td>
-            Pavement — Flexible (USD {{ cost.assumptions.pavement_rate_m2 }}/m²)
-          </td>
-          <td class="right mono">{{ "{:,.0f}".format(cost.pavement_usd) }}</td>
-          <td class="right">
-            {{ "%.1f"|format(100*cost.pavement_usd/total) }}%
-          </td>
-        </tr>
-        <tr>
-          <td>Bridges (Phase 8 inventory)</td>
-          <td class="right mono">{{ "{:,.0f}".format(cost.bridges_usd) }}</td>
-          <td class="right">
-            {{ "%.1f"|format(100*cost.bridges_usd/total) }}%
-          </td>
-        </tr>
-        <tr>
-          <td>Drainage Allowance</td>
-          <td class="right mono">{{ "{:,.0f}".format(cost.drainage_usd) }}</td>
-          <td class="right">
-            {{ "%.1f"|format(100*cost.drainage_usd/total) }}%
-          </td>
-        </tr>
-        <tr>
-          <td>
-            Land Acquisition — {{ "%.0f"|format(cost.land_acquisition_ha) }} ha
-            @ USD {{ "{:,.0f}".format(cost.land_acq_rate_usd_ha) }}/ha
-          </td>
-          <td class="right mono">
-            {{ "{:,.0f}".format(cost.land_acquisition_usd) }}
-          </td>
-          <td class="right">
-            {{ "%.1f"|format(100*cost.land_acquisition_usd/total) }}%
-          </td>
-        </tr>
-        <tr>
-          <td>
-            Environmental Mitigation ({{ cost.assumptions.env_factor_pct }}%)
-          </td>
-          <td class="right mono">
-            {{ "{:,.0f}".format(cost.environmental_usd) }}
-          </td>
-          <td class="right">
-            {{ "%.1f"|format(100*cost.environmental_usd/total) }}%
-          </td>
-        </tr>
-        <tr class="cost-subtotal">
-          <td>Civil Subtotal</td>
-          <td class="right mono">
-            {{ "{:,.0f}".format(cost.civil_subtotal_usd +
-            cost.environmental_usd) }}
-          </td>
-          <td class="right">—</td>
-        </tr>
-        <tr>
-          <td>Contingency ({{ cost.assumptions.contingency_pct }}%)</td>
-          <td class="right mono">
-            {{ "{:,.0f}".format(cost.contingency_usd) }}
-          </td>
-          <td class="right">
-            {{ "%.1f"|format(100*cost.contingency_usd/total) }}%
-          </td>
-        </tr>
-        <tr>
-          <td>
-            Engineering &amp; Administration ({{
-            cost.assumptions.engineering_pct }}%)
-          </td>
-          <td class="right mono">
-            {{ "{:,.0f}".format(cost.engineering_usd) }}
-          </td>
-          <td class="right">
-            {{ "%.1f"|format(100*cost.engineering_usd/total) }}%
-          </td>
-        </tr>
-        <tr class="cost-total">
-          <td>TOTAL PROJECT COST</td>
-          <td class="right mono">
-            {{ "{:,.0f}".format(cost.total_project_cost_usd) }}
-          </td>
-          <td class="right">100.0%</td>
-        </tr>
-      </tbody>
-    </table>
-
-    <p style="margin-top: 8px; font-size: 9pt; color: #555">
-      <strong>Cost per km:</strong> USD {{
-      "{:,.0f}".format(cost.cost_per_km_usd) }}/km &nbsp;·&nbsp;
-      <strong>Total length:</strong> {{ "%.1f"|format(cost.total_length_km) }}
-      km &nbsp;·&nbsp; <strong>Formation width:</strong> {{
-      cost.formation_width_m }} m
-    </p>
-    {% else %}
-    <div class="callout">
-      Cost estimate not available (cost_result is None).
-    </div>
-    {% endif %}
-    <div class="page-break"></div>
-
-    <!-- ══════════════════════════════════════════════════════ -->
-    <!-- APPENDIX A                                             -->
-    <!-- ══════════════════════════════════════════════════════ -->
-    <h2 class="section-title">Appendix A — Assumptions &amp; Phase History</h2>
-
-    <div class="appendix">
-      <h3>Phase History</h3>
-      <ul>
-        <li>
-          <strong>Phases 1–2:</strong> DEM fetch (OpenTopography fallback
-          chain), slope cost, OSM buildings/water
-        </li>
-        <li><strong>Phase 3:</strong> D8 flow-accumulation stream fallback</li>
-        <li>
-          <strong>Phase 4:</strong> Two-resolution coarse-to-fine routing,
-          corridor band masking
-        </li>
-        <li>
-          <strong>Phase 5.0–5.4:</strong> Numba JIT, class-based road discounts,
-          extended LULC table (18 categories), routing polish
-        </li>
-        <li>
-          <strong>Phase 6:</strong> Vertical alignment — grade-clipping FGL,
-          parabolic VCs, AASHTO K-values, SSD check
-        </li>
-        <li>
-          <strong>Phase 7:</strong> Earthwork volumes — trapezoidal AEA,
-          Brückner mass-haul, CSV export
-        </li>
-        <li>
-          <strong>Phase 8:</strong> Bridge &amp; culvert inventory — Shapely
-          crossing detection, D8 culvert siting, cost estimation
-        </li>
-        <li>
-          <strong>Phase 9:</strong> Parametric cost model — 9-component itemised
-          estimate, LULC-weighted land acquisition
-        </li>
-        <li>
-          <strong>Phase 10:</strong> This automated feasibility report (Jinja2 →
-          WeasyPrint)
-        </li>
-      </ul>
-
-      <h3>Design Assumptions</h3>
-      <ul>
-        <li>
-          DEM: SRTM 30 m — vertical accuracy ±5–16 m; horizontal accuracy ±20 m
-        </li>
-        <li>
-          OSM building/water/LULC data may be incomplete in remote areas (see
-          data confidence flag)
-        </li>
-        <li>
-          Earthwork cross-sections are simplified trapezoids; geotechnical
-          investigation required for detailed design
-        </li>
-        <li>
-          Bridge costs use World Bank ROCKS Myanmar mid-range (USD 3,500/m²);
-          actual spans require hydrological study
-        </li>
-        <li>
-          Land acquisition rates from Myanmar DRD RAP guidelines 2022; subject
-          to market fluctuation
-        </li>
-        <li>
-          Contingency (20%) reflects preliminary design maturity per ADB
-          Category B guidance
-        </li>
-        <li>All costs in USD; exchange rate fluctuation not modelled</li>
-      </ul>
+      <!-- ══════════════════════════════════════════════════════ -->
+      <!-- SECTION 6: COST ESTIMATE                              -->
+      <!-- ══════════════════════════════════════════════════════ -->
+      <h2 class="section-title">6. Cost Estimate</h2>
 
       {% if cost_available %}
-      <h3>Unit Rates Applied</h3>
-      <ul>
-        {% for k, v in cost.assumptions.items() %}
-        <li><strong>{{ k|replace("_"," ") }}:</strong> {{ v }}</li>
-        {% endfor %}
-      </ul>
-      {% endif %}
+      <div class="callout">
+        All unit rates from Myanmar DRD schedule of rates and World Bank ROCKS
+        2020–2024. Accuracy ±25–30% at preliminary design stage.
+      </div>
 
-      <h3>Disclaimer</h3>
-      <p style="font-size: 9pt; color: #444; margin-top: 8px">
-        This report is a
-        <strong>PRELIMINARY FEASIBILITY STUDY</strong> generated by an automated
-        pipeline using publicly available terrain and infrastructure data. Cost
-        estimates have an accuracy of ±25–30% at this stage of design maturity.
-        This document is <strong>NOT FOR CONSTRUCTION</strong> and must not be
-        used as the basis for procurement, financing, or environmental clearance
-        without further detailed investigation, ground truthing, and engineering
-        review by qualified professionals.
+      <table>
+        <thead>
+          <tr>
+            <th>Cost Component</th>
+            <th class="right">Amount (USD)</th>
+            <th class="right">% of Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% set total = cost.total_project_cost_usd %}
+          <tr>
+            <td>
+              Earthwork — Cut Excavation (USD {{
+              cost.assumptions.cut_rate_usd_m3 }}/m³)
+            </td>
+            <td class="right mono">
+              {{ "{:,.0f}".format(cost.earthwork_cut_usd) }}
+            </td>
+            <td class="right">
+              {{ "%.1f"|format(100*cost.earthwork_cut_usd/total) }}%
+            </td>
+          </tr>
+          <tr>
+            <td>
+              Earthwork — Import Fill (USD {{ cost.assumptions.fill_rate_usd_m3
+              }}/m³)
+            </td>
+            <td class="right mono">
+              {{ "{:,.0f}".format(cost.earthwork_fill_usd) }}
+            </td>
+            <td class="right">
+              {{ "%.1f"|format(100*cost.earthwork_fill_usd/total) }}%
+            </td>
+          </tr>
+          <tr>
+            <td>
+              Pavement — Flexible (USD {{ cost.assumptions.pavement_rate_m2
+              }}/m²)
+            </td>
+            <td class="right mono">
+              {{ "{:,.0f}".format(cost.pavement_usd) }}
+            </td>
+            <td class="right">
+              {{ "%.1f"|format(100*cost.pavement_usd/total) }}%
+            </td>
+          </tr>
+          <tr>
+            <td>Bridges (Phase 8 inventory)</td>
+            <td class="right mono">{{ "{:,.0f}".format(cost.bridges_usd) }}</td>
+            <td class="right">
+              {{ "%.1f"|format(100*cost.bridges_usd/total) }}%
+            </td>
+          </tr>
+          <tr>
+            <td>Drainage Allowance</td>
+            <td class="right mono">
+              {{ "{:,.0f}".format(cost.drainage_usd) }}
+            </td>
+            <td class="right">
+              {{ "%.1f"|format(100*cost.drainage_usd/total) }}%
+            </td>
+          </tr>
+          <tr>
+            <td>
+              Land Acquisition — {{ "%.0f"|format(cost.land_acquisition_ha) }}
+              ha @ USD {{ "{:,.0f}".format(cost.land_acq_rate_usd_ha) }}/ha
+            </td>
+            <td class="right mono">
+              {{ "{:,.0f}".format(cost.land_acquisition_usd) }}
+            </td>
+            <td class="right">
+              {{ "%.1f"|format(100*cost.land_acquisition_usd/total) }}%
+            </td>
+          </tr>
+          <tr>
+            <td>
+              Environmental Mitigation ({{ cost.assumptions.env_factor_pct }}%)
+            </td>
+            <td class="right mono">
+              {{ "{:,.0f}".format(cost.environmental_usd) }}
+            </td>
+            <td class="right">
+              {{ "%.1f"|format(100*cost.environmental_usd/total) }}%
+            </td>
+          </tr>
+          <tr class="cost-subtotal">
+            <td>Civil Subtotal</td>
+            <td class="right mono">
+              {{ "{:,.0f}".format(cost.civil_subtotal_usd +
+              cost.environmental_usd) }}
+            </td>
+            <td class="right">—</td>
+          </tr>
+          <tr>
+            <td>Contingency ({{ cost.assumptions.contingency_pct }}%)</td>
+            <td class="right mono">
+              {{ "{:,.0f}".format(cost.contingency_usd) }}
+            </td>
+            <td class="right">
+              {{ "%.1f"|format(100*cost.contingency_usd/total) }}%
+            </td>
+          </tr>
+          <tr>
+            <td>
+              Engineering &amp; Administration ({{
+              cost.assumptions.engineering_pct }}%)
+            </td>
+            <td class="right mono">
+              {{ "{:,.0f}".format(cost.engineering_usd) }}
+            </td>
+            <td class="right">
+              {{ "%.1f"|format(100*cost.engineering_usd/total) }}%
+            </td>
+          </tr>
+          <tr class="cost-total">
+            <td>TOTAL PROJECT COST</td>
+            <td class="right mono">
+              {{ "{:,.0f}".format(cost.total_project_cost_usd) }}
+            </td>
+            <td class="right">100.0%</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p style="margin-top: 8px; font-size: 9pt; color: #555">
+        <strong>Cost per km:</strong> USD {{
+        "{:,.0f}".format(cost.cost_per_km_usd) }}/km &nbsp;·&nbsp;
+        <strong>Total length:</strong> {{ "%.1f"|format(cost.total_length_km) }}
+        km &nbsp;·&nbsp; <strong>Formation width:</strong> {{
+        cost.formation_width_m }} m
       </p>
-    </div>
+      {% else %}
+      <div class="callout">
+        Cost estimate not available (cost_result is None).
+      </div>
+      {% endif %}
+      <div class="page-break"></div>
 
-    <div class="report-footer">
-      Generated {{ report_date }} by Highway Alignment Generator · Myanmar
-      Preliminary Feasibility Pipeline · Phases 1–10 · {{ project_title }}
+      <!-- ══════════════════════════════════════════════════════ -->
+      <!-- APPENDIX A                                             -->
+      <!-- ══════════════════════════════════════════════════════ -->
+      <h2 class="section-title">
+        Appendix A — Assumptions &amp; Phase History
+      </h2>
+
+      <div class="appendix">
+        <h3>Phase History</h3>
+        <ul>
+          <li>
+            <strong>Phases 1–2:</strong> DEM fetch (OpenTopography fallback
+            chain), slope cost, OSM buildings/water
+          </li>
+          <li>
+            <strong>Phase 3:</strong> D8 flow-accumulation stream fallback
+          </li>
+          <li>
+            <strong>Phase 4:</strong> Two-resolution coarse-to-fine routing,
+            corridor band masking
+          </li>
+          <li>
+            <strong>Phase 5.0–5.4:</strong> Numba JIT, class-based road
+            discounts, extended LULC table (18 categories), routing polish
+          </li>
+          <li>
+            <strong>Phase 6:</strong> Vertical alignment — grade-clipping FGL,
+            parabolic VCs, AASHTO K-values, SSD check
+          </li>
+          <li>
+            <strong>Phase 7:</strong> Earthwork volumes — trapezoidal AEA,
+            Brückner mass-haul, CSV export
+          </li>
+          <li>
+            <strong>Phase 8:</strong> Bridge &amp; culvert inventory — Shapely
+            crossing detection, D8 culvert siting, cost estimation
+          </li>
+          <li>
+            <strong>Phase 9:</strong> Parametric cost model — 9-component
+            itemised estimate, LULC-weighted land acquisition
+          </li>
+          <li>
+            <strong>Phase 10:</strong> This automated feasibility report (Jinja2
+            → WeasyPrint)
+          </li>
+        </ul>
+
+        <h3>Design Assumptions</h3>
+        <ul>
+          <li>
+            DEM: SRTM 30 m — vertical accuracy ±5–16 m; horizontal accuracy ±20
+            m
+          </li>
+          <li>
+            OSM building/water/LULC data may be incomplete in remote areas (see
+            data confidence flag)
+          </li>
+          <li>
+            Earthwork cross-sections are simplified trapezoids; geotechnical
+            investigation required for detailed design
+          </li>
+          <li>
+            Bridge costs use World Bank ROCKS Myanmar mid-range (USD 3,500/m²);
+            actual spans require hydrological study
+          </li>
+          <li>
+            Land acquisition rates from Myanmar DRD RAP guidelines 2022; subject
+            to market fluctuation
+          </li>
+          <li>
+            Contingency (20%) reflects preliminary design maturity per ADB
+            Category B guidance
+          </li>
+          <li>All costs in USD; exchange rate fluctuation not modelled</li>
+        </ul>
+
+        {% if cost_available %}
+        <h3>Unit Rates Applied</h3>
+        <ul>
+          {% for k, v in cost.assumptions.items() %}
+          <li><strong>{{ k|replace("_"," ") }}:</strong> {{ v }}</li>
+          {% endfor %}
+        </ul>
+        {% endif %}
+
+        <h3>Disclaimer</h3>
+        <p style="font-size: 9pt; color: #444; margin-top: 8px">
+          This report is a
+          <strong>PRELIMINARY FEASIBILITY STUDY</strong> generated by an
+          automated pipeline using publicly available terrain and infrastructure
+          data. Cost estimates have an accuracy of ±25–30% at this stage of
+          design maturity. This document is
+          <strong>NOT FOR CONSTRUCTION</strong> and must not be used as the
+          basis for procurement, financing, or environmental clearance without
+          further detailed investigation, ground truthing, and engineering
+          review by qualified professionals.
+        </p>
+      </div>
+
+      <div class="report-footer">
+        Generated {{ report_date }} by Highway Alignment Generator · Myanmar
+        Preliminary Feasibility Pipeline · Phases 1–10 · {{ project_title }}
+      </div>
     </div>
+    <!-- /container -->
   </body>
 </html>

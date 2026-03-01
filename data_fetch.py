@@ -12,8 +12,20 @@ Phase 5 — Performance:
   _flow_accumulation uses vectorised level-batch processing instead of a
   Python deque loop — O(max_tree_depth) numpy ops vs O(n_cells) Python calls.
   try_jit from jit_utils applies numba JIT when installed.
+
+Phase 14.5 — Data pipeline audit:
+  - OSM Overpass retry with exponential backoff + fail-hard.
+  - WorldCover memory cleanup after tile merge.
+  - Overture dedup chunked sjoin for bounded memory.
+  - DEM void-fill hardened edge-case handling.
+  - Quantised tile cache key (_tile_key) for Phase 15 tile routing.
+  - RasterCache: content-addressed intermediate raster caching.
 """
+import gc
+import hashlib
+import math
 import os
+import time as _time
 import requests
 import logging
 import numpy as np
@@ -32,6 +44,8 @@ from config import (
     DEM_PREFERENCE, DEM_NODATA_SENTINEL,
     OSM_WATER_FALLBACK_TRIGGER, STREAM_ACCUM_THRESHOLD_KM2,
     OSM_LULC_WARN_THRESHOLD,
+    OVERPASS_MAX_RETRIES, OVERPASS_BACKOFF_BASE_S,
+    CACHE_TILE_SIZE_DEG, ENABLE_RASTER_CACHE,
 )
 from geometry_utils import wgs84_to_utm
 
@@ -44,8 +58,101 @@ def _ensure_data_dir():
 
 
 def _bbox_key(bbox_wgs84):
+    """Legacy cache key — kept for backward compatibility with existing cached files."""
     w, s, e, n = [round(v, 4) for v in bbox_wgs84]
     return f"W{w}_S{s}_E{e}_N{n}".replace("-", "m")
+
+
+def _tile_key(bbox_wgs84, tile_size_deg=None):
+    """
+    Phase 14.5: Quantised tile cache key — snaps bbox to a fixed grid.
+    Ensures floating-point boundary jitter does not generate different cache keys
+    for functionally identical bounding boxes.
+    """
+    ts = tile_size_deg or CACHE_TILE_SIZE_DEG
+    w, s, e, n = bbox_wgs84
+    tw = math.floor(w / ts) * ts
+    ts_ = math.floor(s / ts) * ts
+    te = math.ceil(e / ts) * ts
+    tn = math.ceil(n / ts) * ts
+    return f"T_W{tw}_S{ts_}_E{te}_N{tn}".replace("-", "m").replace(".", "p")
+
+
+def _resolve_cache_key(bbox_wgs84):
+    """
+    Phase 14.5: Returns the best cache key, with backward compatibility.
+    Tries the new quantised _tile_key first; if a legacy _bbox_key cached file
+    exists for a given prefix, it will be found by the caller's os.path.exists check.
+    """
+    return _tile_key(bbox_wgs84)
+
+
+def _cache_fingerprint(*inputs):
+    """
+    Phase 14.5: Content-addressed fingerprint for intermediate raster caching.
+    Hashes source file mtimes + config values to detect staleness.
+    """
+    h = hashlib.md5()
+    for inp in inputs:
+        h.update(str(inp).encode())
+    return h.hexdigest()[:12]
+
+
+# ── Phase 14.5: Intermediate Raster Cache ─────────────────────────────────────
+
+class RasterCache:
+    """
+    Content-addressed GeoTIFF cache for expensive vector-to-raster products.
+    
+    Each product is keyed by (name, fingerprint). If the fingerprint matches,
+    the cached file is loaded directly (~<1s) instead of recomputing (~minutes).
+    """
+
+    def __init__(self, cache_dir=None):
+        self._dir = cache_dir or DATA_DIR
+        os.makedirs(self._dir, exist_ok=True)
+
+    def get(self, name, fingerprint, shape=None):
+        """Load cached raster if fingerprint matches. Returns (array, hit_bool)."""
+        if not ENABLE_RASTER_CACHE:
+            return None, False
+        path = os.path.join(self._dir, f"rcache_{name}_{fingerprint}.tif")
+        if os.path.exists(path):
+            try:
+                with rasterio.open(path) as src:
+                    arr = src.read(1)
+                    if shape is not None and arr.shape != shape:
+                        log.warning(
+                            f"RasterCache shape mismatch for {name}: "
+                            f"cached={arr.shape}, expected={shape}. Recomputing."
+                        )
+                        return None, False
+                    log.info(f"RasterCache HIT: {name} (fp={fingerprint})")
+                    return arr, True
+            except Exception as exc:
+                log.warning(f"RasterCache read error for {name} ({exc}). Recomputing.")
+                return None, False
+        return None, False
+
+    def put(self, name, fingerprint, array, transform, crs_epsg=UTM_EPSG):
+        """Persist raster to disk with fingerprint."""
+        if not ENABLE_RASTER_CACHE:
+            return
+        path = os.path.join(self._dir, f"rcache_{name}_{fingerprint}.tif")
+        rows, cols = array.shape
+        try:
+            with rasterio.open(
+                path, "w", driver="GTiff",
+                height=rows, width=cols, count=1,
+                dtype=array.dtype,
+                crs=f"EPSG:{crs_epsg}",
+                transform=transform,
+                compress="deflate",
+            ) as dst:
+                dst.write(array, 1)
+            log.info(f"RasterCache STORE: {name} → {path}")
+        except Exception as exc:
+            log.warning(f"RasterCache write failed for {name} ({exc}). Continuing without cache.")
 
 
 def _mock_dem(bbox_wgs84, resolution_m):
@@ -92,18 +199,39 @@ def _reproject_to_utm(dem_wgs, wgs_tf, wgs_crs, wgs_w, wgs_h,
         dst_nodata=DEM_NODATA_SENTINEL,
     )
 
-    # Fix I: void-fill the UTM DEM before writing to cache.
-    # Bilinear reprojection can leave edge sentinel cells (values near -9999)
-    # that corrupt slope, earthwork-proxy, and floodplain calculations downstream.
+    # Phase 14.5 hardened: void-fill the UTM DEM before writing to cache.
+    # Uses exact sentinel comparison instead of threshold range.
+    # Bilinear reprojection can leave edge sentinel cells that corrupt
+    # slope, earthwork-proxy, and floodplain calculations downstream.
     # EDT nearest-neighbour fill replaces all sentinel cells with the nearest
     # valid elevation value, producing a seamless surface for all consumers.
-    nodata_mask = (dem_utm <= DEM_NODATA_SENTINEL + 100)
+    nodata_mask = (dem_utm == DEM_NODATA_SENTINEL)
+    # Also catch near-sentinel values from bilinear interpolation at edges
+    nodata_mask |= (dem_utm < -500)
     if nodata_mask.any():
         from scipy.ndimage import distance_transform_edt
+        valid_count = int((~nodata_mask).sum())
+        if valid_count == 0:
+            log.error("DEM void-fill: entire raster is NoData — cannot fill.")
+            raise RuntimeError("DEM reprojection produced all-NoData raster.")
         _, idx = distance_transform_edt(nodata_mask, return_indices=True)
         dem_utm[nodata_mask] = dem_utm[idx[0][nodata_mask], idx[1][nodata_mask]]
         n_filled = int(nodata_mask.sum())
-        log.info(f"DEM void-fill: {n_filled:,} nodata cells filled by EDT nearest-neighbour.")
+        pct_filled = 100.0 * n_filled / dem_utm.size
+        log.info(
+            f"DEM void-fill: {n_filled:,} nodata cells filled by EDT nearest-neighbour "
+            f"({pct_filled:.1f}% of raster)."
+        )
+
+    # Post-fill assertion: no sentinels should remain
+    remaining_nodata = int(np.sum(dem_utm == DEM_NODATA_SENTINEL))
+    if remaining_nodata > 0:
+        log.error(
+            f"DEM void-fill FAILED: {remaining_nodata:,} sentinel cells remain after fill."
+        )
+        raise RuntimeError(
+            f"DEM void-fill incomplete: {remaining_nodata} cells still at sentinel value."
+        )
 
     with rasterio.open(
         cache_utm, "w", driver="GTiff",
@@ -165,22 +293,24 @@ def fetch_dem(bbox_wgs84, resolution_m=RESOLUTION):
     Returns (dem_utm_array, utm_affine_transform, dem_source_label).
     """
     _ensure_data_dir()
-    key = _bbox_key(bbox_wgs84)
+    tile_key = _tile_key(bbox_wgs84)
+    legacy_key = _bbox_key(bbox_wgs84)
 
-    # Check for any cached UTM DEM (any type acceptable)
-    for dem_type in DEM_PREFERENCE:
-        cache_utm = os.path.join(DATA_DIR, f"dem_utm_{dem_type}_{key}.tif")
-        if os.path.exists(cache_utm):
-            log.info(f"Loading cached {dem_type} UTM DEM: {cache_utm}")
-            with rasterio.open(cache_utm) as src:
-                dem_utm = src.read(1).astype(np.float32)
-                utm_tf  = src.transform
-            return dem_utm, utm_tf, dem_type
+    # Check for any cached UTM DEM (try new tile key first, then legacy)
+    for key in [tile_key, legacy_key]:
+        for dem_type in DEM_PREFERENCE:
+            cache_utm = os.path.join(DATA_DIR, f"dem_utm_{dem_type}_{key}.tif")
+            if os.path.exists(cache_utm):
+                log.info(f"Loading cached {dem_type} UTM DEM: {cache_utm}")
+                with rasterio.open(cache_utm) as src:
+                    dem_utm = src.read(1).astype(np.float32)
+                    utm_tf  = src.transform
+                return dem_utm, utm_tf, dem_type
 
-    # Try to download in preference order
+    # Try to download in preference order (use new tile key for caching)
     for dem_type in DEM_PREFERENCE:
-        cache_wgs = os.path.join(DATA_DIR, f"dem_wgs84_{dem_type}_{key}.tif")
-        cache_utm = os.path.join(DATA_DIR, f"dem_utm_{dem_type}_{key}.tif")
+        cache_wgs = os.path.join(DATA_DIR, f"dem_wgs84_{dem_type}_{tile_key}.tif")
+        cache_utm = os.path.join(DATA_DIR, f"dem_utm_{dem_type}_{tile_key}.tif")
         try:
             dem_utm, utm_tf = _try_download_dem(dem_type, bbox_wgs84, cache_wgs, cache_utm)
             log.info(f"DEM acquired: {dem_type} @ 30 m")
@@ -385,14 +515,29 @@ def fetch_osm_layers(bbox_wgs84):
     Fetch buildings, water, existing roads (highway), and land cover (landuse/natural) 
     from OSM via Overpass.
     Returns (buildings_gdf, water_gdf, roads_gdf, lulc_gdf, osm_stats_dict).
-    Empty GeoDataFrames are returned on failure — check osm_stats for coverage.
+
+    Phase 14.5: Retry with exponential backoff. Raises RuntimeError on permanent
+    failure instead of silently returning empty data.
     """
     _ensure_data_dir()
-    key = _bbox_key(bbox_wgs84)
-    cache_buildings = os.path.join(DATA_DIR, f"buildings_{key}.gpkg")
-    cache_water     = os.path.join(DATA_DIR, f"water_{key}.gpkg")
-    cache_roads     = os.path.join(DATA_DIR, f"roads_{key}.gpkg")
-    cache_lulc      = os.path.join(DATA_DIR, f"lulc_{key}.gpkg")
+    tile_key = _tile_key(bbox_wgs84)
+    legacy_key = _bbox_key(bbox_wgs84)
+
+    # Phase 14.5: backward-compatible cache file resolution
+    def _resolve_cache(prefix):
+        """Try new tile key first, then fall back to legacy bbox key."""
+        new_path = os.path.join(DATA_DIR, f"{prefix}_{tile_key}.gpkg")
+        if os.path.exists(new_path):
+            return new_path
+        legacy_path = os.path.join(DATA_DIR, f"{prefix}_{legacy_key}.gpkg")
+        if os.path.exists(legacy_path):
+            return legacy_path
+        return new_path  # default to new key for fresh downloads
+
+    cache_buildings = _resolve_cache("buildings")
+    cache_water     = _resolve_cache("water")
+    cache_roads     = _resolve_cache("roads")
+    cache_lulc      = _resolve_cache("lulc")
 
     west  = float(bbox_wgs84[0])
     south = float(bbox_wgs84[1])
@@ -416,26 +561,45 @@ def fetch_osm_layers(bbox_wgs84):
             except Exception as exc:
                 log.warning(f"Cache read failed ({exc}), re-downloading {label}.")
 
-        log.info(f"Fetching OSM {label} from Overpass …")
-        try:
-            gdf = ox.features_from_bbox(
-                bbox=(west, south, east, north),
-                tags=tags,
-            )
-            # Retain specific tags if requested, otherwise just geometry
-            if "retain_tags" in kwargs:
-                cols_to_keep = ["geometry"] + [t for t in kwargs["retain_tags"] if t in gdf.columns]
-                gdf = gdf[cols_to_keep].copy().reset_index(drop=True)
-            else:
-                gdf = gdf[["geometry"]].copy().reset_index(drop=True)
-            
-            gdf.to_file(cache_path, driver="GPKG")
-            stats[stat_key] = len(gdf)
-            log.info(f"OSM {label}: {len(gdf)} features fetched and cached.")
-            return gdf
-        except Exception as exc:
-            log.warning(f"OSM {label} fetch failed ({exc}). Returning empty layer.")
-            return gpd.GeoDataFrame(geometry=[], crs="EPSG:4326")
+        # Phase 14.5: Retry with exponential backoff, fail-hard on exhaustion
+        max_retries = OVERPASS_MAX_RETRIES
+        backoff_base = OVERPASS_BACKOFF_BASE_S
+        last_exc = None
+
+        for attempt in range(1, max_retries + 1):
+            log.info(f"Fetching OSM {label} from Overpass (attempt {attempt}/{max_retries}) …")
+            try:
+                gdf = ox.features_from_bbox(
+                    bbox=(west, south, east, north),
+                    tags=tags,
+                )
+                # Retain specific tags if requested, otherwise just geometry
+                if "retain_tags" in kwargs:
+                    cols_to_keep = ["geometry"] + [t for t in kwargs["retain_tags"] if t in gdf.columns]
+                    gdf = gdf[cols_to_keep].copy().reset_index(drop=True)
+                else:
+                    gdf = gdf[["geometry"]].copy().reset_index(drop=True)
+
+                gdf.to_file(cache_path, driver="GPKG")
+                stats[stat_key] = len(gdf)
+                log.info(f"OSM {label}: {len(gdf)} features fetched and cached.")
+                return gdf
+            except Exception as exc:
+                last_exc = exc
+                if attempt < max_retries:
+                    wait = backoff_base * (2 ** (attempt - 1))
+                    log.warning(
+                        f"OSM {label} attempt {attempt}/{max_retries} failed ({exc}). "
+                        f"Retrying in {wait:.0f}s …"
+                    )
+                    _time.sleep(wait)
+
+        # All retries exhausted — fail hard
+        raise RuntimeError(
+            f"OSM {label} fetch failed after {max_retries} attempts. "
+            f"Last error: {last_exc}. "
+            f"Cannot proceed — empty data would cause routing through buildings/water."
+        ) from last_exc
 
     buildings = _load_or_fetch(
         cache_buildings,
@@ -546,8 +710,14 @@ def fetch_worldcover(bbox_wgs84):
     Returns (None, None) if the fetch fails (caller should fall back to OSM).
     """
     _ensure_data_dir()
-    key = _bbox_key(bbox_wgs84)
-    cache_utm = os.path.join(DATA_DIR, f"worldcover_utm_{key}.tif")
+    tile_key = _tile_key(bbox_wgs84)
+    legacy_key = _bbox_key(bbox_wgs84)
+
+    # Phase 14.5: backward-compatible cache lookup
+    cache_utm = os.path.join(DATA_DIR, f"worldcover_utm_{tile_key}.tif")
+    legacy_cache = os.path.join(DATA_DIR, f"worldcover_utm_{legacy_key}.tif")
+    if os.path.exists(legacy_cache) and not os.path.exists(cache_utm):
+        cache_utm = legacy_cache
 
     # Check cache first
     if os.path.exists(cache_utm):
@@ -620,14 +790,26 @@ def fetch_worldcover(bbox_wgs84):
             else:
                 merged = rioxarray.merge_arrays(datasets, nodata=255)
 
+            # Phase 14.5: Explicit cleanup — release individual tile memory
+            # before clipping/reprojection to avoid OOM on large tile requests.
+            for ds in datasets:
+                try:
+                    ds.close()
+                except Exception:
+                    pass
+            del datasets
+            gc.collect()
+
             # Clip to bounding box (WGS-84)
             clipped = merged.rio.clip_box(
                 minx=west, miny=south, maxx=east, maxy=north
             )
+            del merged
 
             # Reproject to UTM
             from config import UTM_EPSG
             reprojected = clipped.rio.reproject(f"EPSG:{UTM_EPSG}")
+            del clipped
 
             # Extract numpy array and transform
             lulc_arr = reprojected.values
@@ -635,6 +817,8 @@ def fetch_worldcover(bbox_wgs84):
                 lulc_arr = lulc_arr[0]  # (band, row, col) → (row, col)
             lulc_arr = lulc_arr.astype(np.uint8)
             utm_tf = reprojected.rio.transform()
+            del reprojected
+            gc.collect()
 
             # Cache to disk
             rows_wc, cols_wc = lulc_arr.shape
@@ -711,8 +895,14 @@ def fetch_overture_buildings(bbox_wgs84):
     These have dramatically better rural Myanmar coverage than OSM alone.
     """
     _ensure_data_dir()
-    key = _bbox_key(bbox_wgs84)
-    cache_path = os.path.join(DATA_DIR, f"overture_buildings_{key}.gpkg")
+    tile_key = _tile_key(bbox_wgs84)
+    legacy_key = _bbox_key(bbox_wgs84)
+
+    # Phase 14.5: backward-compatible cache lookup
+    cache_path = os.path.join(DATA_DIR, f"overture_buildings_{tile_key}.gpkg")
+    legacy_path = os.path.join(DATA_DIR, f"overture_buildings_{legacy_key}.gpkg")
+    if os.path.exists(legacy_path) and not os.path.exists(cache_path):
+        cache_path = legacy_path
 
     if os.path.exists(cache_path):
         try:
@@ -816,23 +1006,28 @@ def merge_building_sources(osm_buildings, overture_buildings, dedup_radius_m=15.
     osm_centroids = osm_buildings.geometry.centroid
     ov_centroids = ov_utm.geometry.centroid
 
-    # Fix VIII: Overture dedup via geometry intersection (buffered sjoin).
-    # Old centroid-proximity dedup caused both false-drops (large buildings with
-    # centroids > 15 m apart but overlapping footprints) and false-keeps
-    # (footprints whose centroids differ by > 15 m due to digitisation angle).
-    # New: buffer Overture footprints by 10 m and spatial-join against OSM.
-    # Any Overture building that intersects an OSM building within 10 m is
-    # treated as a duplicate and dropped.
+    # Fix VIII + Phase 14.5: Overture dedup via geometry intersection (buffered sjoin).
+    # Chunked processing to bound peak memory on large datasets.
+    DEDUP_CHUNK_SIZE = 50_000
     try:
         ov_buffered = ov_utm.copy()
         ov_buffered["geometry"] = ov_utm.geometry.buffer(10.0)
-        duplicates = gpd.sjoin(
-            ov_buffered, osm_buildings[["geometry"]],
-            how="inner", predicate="intersects"
-        )
-        dup_indices = duplicates.index.unique()
-        ov_new = ov_utm.drop(index=dup_indices).copy()
+
+        # Phase 14.5: Chunked sjoin to cap memory on large tiles
+        dup_indices = set()
+        n_chunks = max(1, (len(ov_buffered) + DEDUP_CHUNK_SIZE - 1) // DEDUP_CHUNK_SIZE)
+        log.info(f"Overture dedup: {len(ov_buffered)} buildings in {n_chunks} chunk(s)")
+        for start in range(0, len(ov_buffered), DEDUP_CHUNK_SIZE):
+            chunk = ov_buffered.iloc[start:start + DEDUP_CHUNK_SIZE]
+            duplicates = gpd.sjoin(
+                chunk, osm_buildings[["geometry"]],
+                how="inner", predicate="intersects"
+            )
+            dup_indices.update(duplicates.index.unique())
+        ov_new = ov_utm.drop(index=list(dup_indices)).copy()
         n_dedup = len(ov_utm) - len(ov_new)
+        del ov_buffered
+        gc.collect()
     except Exception as exc:
         # Fallback to centroid-proximity if sjoin fails (e.g. empty GDF)
         log.warning(f"Overture sjoin dedup failed ({exc}), falling back to centroid proximity.")

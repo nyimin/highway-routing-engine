@@ -25,9 +25,9 @@ log = logging.getLogger("highway_alignment")
 
 # ── Coordinate helpers ────────────────────────────────────────────────────────
 
-def bbox_with_margin(pt_a, pt_b, margin=0.20):
-    lons = [pt_a[0], pt_b[0]]
-    lats = [pt_a[1], pt_b[1]]
+def bbox_with_margin(waypoints, margin=0.20):
+    lons = [pt[0] for pt in waypoints]
+    lats = [pt[1] for pt in waypoints]
     dlon = (max(lons) - min(lons)) * margin
     dlat = (max(lats) - min(lats)) * margin
     dlon = max(dlon, 0.05)
@@ -557,7 +557,7 @@ def compute_metadata(line_utm, slope_pct, transform, dem=None,
 
     Data confidence levels: HIGH | MEDIUM | LOW
     """
-    from config import POINT_A, POINT_B, SCENARIO_PROFILE, DESIGN_SPEED_KMPH
+    from config import SCENARIO_PROFILE, DESIGN_SPEED_KMPH, WAYPOINTS
 
     length_m = line_utm.length
     max_slope = 0.0
@@ -598,8 +598,7 @@ def compute_metadata(line_utm, slope_pct, transform, dem=None,
         "min_curve_radius_m": MIN_CURVE_RADIUS,
         "design_speed_kmph": DESIGN_SPEED_KMPH,
         "scenario_profile": SCENARIO_PROFILE,
-        "point_a_lonlat": list(POINT_A),
-        "point_b_lonlat": list(POINT_B),
+        "waypoints": [list(pt) for pt in WAYPOINTS],
         "dem_source": dem_source,
         "osm_building_count": osm_stats.get("buildings", 0),
         "osm_water_count": osm_stats.get("water", 0),

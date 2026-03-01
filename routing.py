@@ -15,11 +15,13 @@ import logging
 import numpy as np
 from scipy.ndimage import binary_dilation, label as nd_label
 
+from skimage.measure import block_reduce
+
 from config import (
     RUBBER_BAND_MACRO_W, RUBBER_BAND_MICRO_W,
     MIN_BRIDGE_SPACING_M, IMPASSABLE,
     COARSE_FACTOR, CORRIDOR_BAND_KM, FAST_MODE, ROUTING_ENGINE,
-    TURNING_ANGLE_FILTER_DEG,
+    TURNING_ANGLE_FILTER_DEG, BRIDGE_SCOUT_RESOLUTION_M
 )
 
 log = logging.getLogger("highway_alignment")
@@ -448,6 +450,87 @@ def multi_pass_routing(cost, start_rc, end_rc, water_mask, transform,
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# Phase 17: Constraint-First Siting (Bridge Scouting)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def generate_bridge_corridors(cost_pyramid, water_mask, start_rc, end_rc, transform, resolution_m, dem=None):
+    """
+    Scouts for optimal bridge crossings across IMPASSABLE major rivers before
+    the main MS-LCP routing begins.
+    
+    1. Uses the coarsest level of the cost pyramid to perform a rapid search.
+    2. Temporarily relaxes the IMPASSABLE water penalty to a high finite cost
+       so the router can punch through.
+    3. Traces a scout path from start to end.
+    4. Identifies river crossings and uses `find_optimal_crossings` to pinpoint
+       the best abutment locations.
+    5. Returns a boolean mask (at Level 0 resolution) where the bridge corridors
+       are burned in.
+    """
+    log.info("Phase 17: Initiating Bridge Scouting pass over major rivers...")
+    
+    levels = len(cost_pyramid) - 1
+    coarsest_ratio = 2 ** levels  # Assuming DOWNSAMPLE_RATIO = 2
+    
+    coarse_cost = cost_pyramid[-1].copy()
+    rows_c, cols_c = coarse_cost.shape
+    
+    # Temporarily relax IMPASSABLE water to allow the scout to cross it
+    # We only want to relax water, not mountain cliffs or borders, but at this scale
+    # resolving the difference precisely is hard. We'll downsample the water_mask.
+    water_mask_coarse = block_reduce(water_mask > 0, block_size=(coarsest_ratio, coarsest_ratio), func=np.max)
+    # Pad to match coarse_cost shape if necessary due to odd dimensions
+    water_mask_coarse = np.pad(water_mask_coarse, ((0, max(0, rows_c - water_mask_coarse.shape[0])), 
+                                                   (0, max(0, cols_c - water_mask_coarse.shape[1]))), mode='constant')
+    water_mask_coarse = water_mask_coarse[:rows_c, :cols_c]
+    
+    # Relax IMPASSABLE where there is water
+    mask_to_relax = water_mask_coarse & (coarse_cost >= IMPASSABLE)
+    coarse_cost[mask_to_relax] = 50_000.0  # High but finite
+    
+    curr_start = _clamp_rc((start_rc[0] // coarsest_ratio, start_rc[1] // coarsest_ratio), coarse_cost.shape)
+    curr_end   = _clamp_rc((end_rc[0] // coarsest_ratio, end_rc[1] // coarsest_ratio), coarse_cost.shape)
+    
+    # Apply a gentle rubber band to keep the scout from wandering wildly
+    scout_cost = apply_rubber_band_penalty(coarse_cost, curr_start, curr_end, weight=1.0)
+    scout_path_coarse = find_path(scout_cost, curr_start, curr_end)
+    
+    # Upsample the scout path to Level 0 resolution to accurately assess water hits
+    scout_path_fine = []
+    for r, c in scout_path_coarse:
+        fine_r = int(r * coarsest_ratio + coarsest_ratio // 2)
+        fine_c = int(c * coarsest_ratio + coarsest_ratio // 2)
+        fine_r = max(0, min(cost_pyramid[0].shape[0] - 1, fine_r))
+        fine_c = max(0, min(cost_pyramid[0].shape[1] - 1, fine_c))
+        scout_path_fine.append((fine_r, fine_c))
+        
+    # Find the optimal crossing sites based on this scout path
+    bridges_rc = find_optimal_crossings(water_mask, scout_path_fine, transform, resolution_m, dem=dem, search_window_px=400)
+    
+    bridge_corridors_mask = np.zeros(cost_pyramid[0].shape, dtype=bool)
+    if not bridges_rc:
+        log.info("Bridge Scouting: No major river crossings necessary.")
+        return bridge_corridors_mask
+
+    # Burn 5x5 corridors around the bridge abutments to ensure the MS-LCP router 
+    # can easily find and traverse them.
+    from skimage.draw import disk
+    bridge_count = 0
+    clean_bridges = []
+    for br in bridges_rc:
+        if not clean_bridges or br != clean_bridges[-1]:
+            clean_bridges.append(br)
+            bridge_count += 1
+            
+    for r, c in clean_bridges:
+        rr, cc = disk((r, c), radius=10, shape=bridge_corridors_mask.shape)
+        bridge_corridors_mask[rr, cc] = True
+        
+    log.info(f"Bridge Scouting complete: locked in {bridge_count} major bridge corridors.")
+    return bridge_corridors_mask
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Phase 4: Multi-Scale Segmented LCP (Tang & Dou 2023)
 # ═══════════════════════════════════════════════════════════════════════════════
 import concurrent.futures
@@ -564,16 +647,51 @@ def multi_scale_lcp(cost_pyramid, start_rc, end_rc, water_mask, transform, resol
     4. Execute final micro-alignment pass with highway constraints.
     """
     from config import DOWNSAMPLE_RATIO, WAYPOINT_ANGLE_THRESH_DEG, PARALLEL_WAYPOINT_THRESH, FAST_MODE
+    from config import RUBBER_BAND_MACRO_W
 
     levels = len(cost_pyramid) - 1
     log.info(f"MS-LCP: Starting multi-scale routing over {levels} downsampled levels.")
     
+    # Phase 17: Constraint-First Bridge Scouting
+    bridge_corridors_mask = generate_bridge_corridors(
+        cost_pyramid, water_mask, start_rc, end_rc, transform, resolution_m, dem
+    )
+    
+    if np.any(bridge_corridors_mask):
+         # Update the Level 0 cost surface to punch through the IMPASSABLE rivers
+         cost_pyramid[0][bridge_corridors_mask] = np.minimum(cost_pyramid[0][bridge_corridors_mask], 5000.0)
+         
+         # We must propagate this relaxation up the pyramid so the coarse layers
+         # know a crossing exists.
+         from skimage.measure import block_reduce
+         current_cost = cost_pyramid[0]
+         for lvl in range(1, levels + 1):
+             ratio = DOWNSAMPLE_RATIO
+             pad_rows = (ratio - (current_cost.shape[0] % ratio)) % ratio
+             pad_cols = (ratio - (current_cost.shape[1] % ratio)) % ratio
+             if pad_rows > 0 or pad_cols > 0:
+                 current_cost = np.pad(current_cost, ((0, pad_rows), (0, pad_cols)), mode='constant', constant_values=IMPASSABLE)
+             
+             import warnings
+             with warnings.catch_warnings():
+                 warnings.simplefilter("ignore", category=RuntimeWarning)
+                 safe_cost = np.where(current_cost >= IMPASSABLE * 0.5, np.nan, current_cost)
+                 downsampled = block_reduce(safe_cost, block_size=(ratio, ratio), func=np.nanmean, cval=np.nan)
+             downsampled[np.isnan(downsampled)] = IMPASSABLE
+             
+             # Re-apply the Block Impassable Mask logic from cost_surface.py
+             impassable_mask = (current_cost >= IMPASSABLE * 0.5).astype(np.float32)
+             impassable_prop = block_reduce(impassable_mask, block_size=(ratio, ratio), func=np.mean, cval=1.0)
+             downsampled[impassable_prop > 0.25] = IMPASSABLE
+             
+             cost_pyramid[lvl] = downsampled
+             current_cost = cost_pyramid[lvl]
+
     # 1. Base route on the coarsest level
     coarsest_ratio = DOWNSAMPLE_RATIO ** levels
     curr_start = _clamp_rc((start_rc[0] // coarsest_ratio, start_rc[1] // coarsest_ratio), cost_pyramid[-1].shape)
     curr_end = _clamp_rc((end_rc[0] // coarsest_ratio, end_rc[1] // coarsest_ratio), cost_pyramid[-1].shape)
     
-    from config import RUBBER_BAND_MACRO_W
     log.info(f"MS-LCP: Pass 0 (Level {levels}) - Routing on {cost_pyramid[-1].shape} grid.")
     coarse_cost = apply_rubber_band_penalty(cost_pyramid[-1], curr_start, curr_end, weight=RUBBER_BAND_MACRO_W)
     curr_path = find_path(coarse_cost, curr_start, curr_end)

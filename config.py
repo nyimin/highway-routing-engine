@@ -10,8 +10,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
-POINT_A = (94.59079006576709503, 17.17894837308733358)
-POINT_B = (96.457154, 17.486777)
+# list of (lon, lat) tuples.
+# Note: At least 2 waypoints are required.
+WAYPOINTS = [
+    (94.590790, 17.178948),  # Point A (Start)
+    (96.457154, 17.486777),  # Point B (Middle)
+    (97.908139, 17.562118),  # Point C (End)
+]
 OUTPUT_FILE = "preliminary_route.geojson"
 
 # ── Coordinate System ─────────────────────────────────────────────────────────
@@ -222,6 +227,10 @@ SLOPE_LULC_INTERACT = 0.5
 # smoothly, eliminating boundary-hugging artefacts.
 LULC_EDGE_DECAY_M = 150  # Distance over which penalty decays to 1.0 outside polygon
 
+# ── Grid / Routing ────────────────────────────────────────────────────────────
+IMPASSABLE   = 1e9
+BORDER_CELLS = 20
+
 # ── Water Crossing Penalties (per river tier) ──────────────────────────────────
 # Tier 0: micro-stream < 10 m  → culvert / ford
 # Tier 1: minor stream 10–50 m → small bridge
@@ -235,9 +244,15 @@ LULC_EDGE_DECAY_M = 150  # Distance over which penalty decays to 1.0 outside pol
 # Tier 0: culvert (<10 m)             → floor at 2,000  (cheap but not trivial)
 # Tier 1: small bridge (10–50 m)      → floor at 8,000  (above land p95)
 # Tier 2: medium bridge (50–200 m)    → floor at 50,000 (Chindwin approach)
-# Tier 3: major bridge (200–500 m)    → floor at 200,000
-# Tier 4: Ayeyarwady-scale (>500 m)   → floor at 500,000 (near-impassable)
-WATER_PENALTY_TIERS = [2_000, 8_000, 50_000, 200_000, 500_000]
+# Tier 3: major bridge (200–500 m)    → strictly IMPASSABLE (use Bridge Scouting to cross)
+# Tier 4: Ayeyarwady-scale (>500 m)   → strictly IMPASSABLE (use Bridge Scouting to cross)
+WATER_PENALTY_TIERS = [2_000, 8_000, 50_000, IMPASSABLE, IMPASSABLE]
+
+# ── Phase 17: Constraint-First Bridge Scouting ────────────────────────────────
+# Resolution (m) for the pre-routing bridge scouting pass. A coarser grid
+# (e.g. 120m) allows rapid identification of optimal crossing axes across major rivers.
+BRIDGE_SCOUT_RESOLUTION_M: float = 120.0
+
 
 # Bridge constraints
 MIN_BRIDGE_SPACING_M = 10_000   # Minimum distance between two major bridge sites
@@ -248,10 +263,6 @@ FLOODPLAIN_MIN_FILL_M = 2.5     # Assumed min height of embankment across a floo
 
 # ── Legacy flat penalty (retained as fallback if hierarchy fails) ───────────────
 WATER_PENALTY = 5.0
-
-# ── Grid / Routing ────────────────────────────────────────────────────────────
-IMPASSABLE   = 1e9
-BORDER_CELLS = 20
 
 # ── Phase 4: Multi-Resolution Routing Pyramid (Tang & Dou 2023) ───────────────
 # Progressively downsamples the cost surface to create a multi-scale pyramid.
@@ -597,3 +608,31 @@ ENGINEERING_FACTOR:    float = 0.10   # 10% engineering, supervision, admin
 OUTPUT_COST_CSV:    str = "output/cost_estimate.csv"
 OUTPUT_REPORT_HTML: str = "output/feasibility_report.html"
 OUTPUT_REPORT_PDF:  str = "output/feasibility_report.pdf"
+
+# ── Phase 14.5: Data Pipeline Resilience & Caching ────────────────────────────
+
+# OSM Overpass retry — fail-hard after exhausting retries.
+# Exponential backoff: wait = BASE_S * 2^(attempt-1) → 5s, 10s, 20s.
+OVERPASS_MAX_RETRIES:    int   = 3
+OVERPASS_BACKOFF_BASE_S: float = 5.0
+
+# Quantised tile cache key grid size (degrees).
+# Snaps bounding boxes to a fixed grid so that slightly different floating-point
+# boundaries produce the same cache key.  0.5° tiles ≈ 55 km at the equator.
+CACHE_TILE_SIZE_DEG: float = 0.5
+
+# Intermediate raster caching — persist expensive vector-to-raster products
+# (building penalty map, water/roads masks, LULC, cost surface) as GeoTIFFs
+# keyed by a content-addressed fingerprint.  On re-run, if inputs haven't
+# changed, the cached raster loads in <1s instead of recomputing (2–3 min).
+ENABLE_RASTER_CACHE: bool = True
+
+# ── Phase 15: Tile Routing ────────────────────────────────────────────────────
+# When corridor length exceeds TILE_ROUTING_THRESHOLD_KM, the pipeline
+# auto-partitions the corridor into overlapping tiles processed sequentially.
+# Peak memory stays bounded at ~2.5 GB regardless of corridor length.
+ENABLE_TILE_ROUTING:      bool  = True   # Auto-activate for long corridors
+TILE_LENGTH_KM:           float = 100.0  # Target tile length along corridor
+TILE_OVERLAP_KM:          float = 10.0   # Overlap between adjacent tiles
+TILE_LATERAL_MARGIN_DEG:  float = 0.20   # Lateral buffer around corridor axis (degrees)
+

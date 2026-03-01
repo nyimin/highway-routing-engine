@@ -770,7 +770,7 @@ def _apply_road_discounts(roads_gdf, roads_mask, cost, transform, shape, resolut
 def build_cost_surface(slope_pct, building_penalty_map, water_mask, roads_mask=None,
                        roads_gdf=None, lulc_penalty_map=None, nodata_mask=None,
                        dem=None, curvature=None, resolution_m=30, transform=None,
-                       exclusion_gdf=None):
+                       exclusion_gdf=None, bridge_corridors_mask=None):
     """
     Assemble the full cost surface.
 
@@ -847,13 +847,17 @@ def build_cost_surface(slope_pct, building_penalty_map, water_mask, roads_mask=N
         hierarchy_penalty = _river_hierarchy_penalties(
             water_closed.astype(np.float32), resolution_m
         )
-        # Use np.maximum (not addition) so water cells can NEVER be cheaper than
-        # the tier penalty regardless of underlying terrain cost.
-        # Previously: cost + penalty (water median was only ~12 vs land p75=752 —
-        # additive penalty was swamped by low base costs on flat water areas).
-        # Fix: water cell cost = max(existing_cost, tier_penalty) so a Tier-3
-        # river (200m span) always costs at least WATER_PENALTY_TIERS[3].
+        # ── Phase 17: Constraint-First Siting ────────────────────────────
+        # Apply the hierarchy penalties as the floor for water pixels.
+        # Major rivers (Tier 3, 4) will now be set to IMPASSABLE.
         cost = np.where(water_closed, np.maximum(cost, hierarchy_penalty), cost)
+        
+        # Punch through the IMPASSABLE barrier where Bridge Corridors exist.
+        if bridge_corridors_mask is not None:
+            # Drop the cost on approved bridge corridors back to a high-but-passable level
+            # representing the structure cost (e.g. 5,000x penalty).
+            cost = np.where(bridge_corridors_mask, np.minimum(cost, 5000.0), cost)
+            log.info(f"Burned bridge corridors: relaxed {bridge_corridors_mask.sum():,} water pixels.")
 
         # ── 4. Bridge abutment zone recovery ─────────────────────────────
         # Relax steep-bank cells immediately adjacent to water to encourage
