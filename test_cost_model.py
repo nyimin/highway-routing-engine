@@ -126,7 +126,8 @@ def test_contingency_engineering():
         engineering_factor=0.10,
     )
     civil = result.civil_subtotal_usd
-    assert abs(civil - 10_000_000.0) < 10.0, f"Civil subtotal wrong: {civil}"
+    expected_civil = 10_000_000.0 + result.drainage_usd
+    assert abs(civil - expected_civil) < 10.0, f"Civil subtotal wrong: {civil}"
     assert abs(result.contingency_usd - civil * 0.20) < 10.0, (
         f"Contingency wrong: {result.contingency_usd}"
     )
@@ -174,13 +175,13 @@ def test_null_earthwork_graceful():
 # ── Test 6: Null structures — graceful ───────────────────────────────────────
 
 def test_null_structures_graceful():
-    """si_result=None → bridges_usd == 0, culverts_usd == 0, no crash."""
+    """si_result=None → bridges_usd == 0, drainage_usd != 0 (it's length based), no crash."""
     result = compute_cost_model(
-        meta=_make_meta(),
+        meta=_make_meta(length_km=0.0), # Force 0 length to test 0 drainage
         ew_result=None, si_result=None,
     )
     assert result.bridges_usd == 0.0, "Bridge cost should be 0 with no si_result"
-    assert result.culverts_usd == 0.0, "Culvert cost should be 0 with no si_result"
+    assert result.drainage_usd == 0.0, "Drainage cost should be 0 for 0 km length"
     print("  ✓ test_null_structures_graceful")
 
 

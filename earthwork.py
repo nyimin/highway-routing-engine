@@ -245,8 +245,8 @@ def compute_earthwork(
     distances_m: np.ndarray,
     cut_fill_m: np.ndarray,
     formation_width_m: float,
-    cut_batter_HV: float = 1.0,
-    fill_batter_HV: float = 1.5,
+    cut_batter_HV: float,
+    fill_batter_HV: float,
     swell_factor: float = 1.25,
 ) -> EarthworkResult:
     """

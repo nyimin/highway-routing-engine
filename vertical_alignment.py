@@ -194,6 +194,72 @@ def _detect_vpi_candidates(distances_m: np.ndarray,
              f"(min spacing {min_spacing_m:.0f} m, max segment {max_segment_m:.0f} m)")
     return result
 
+# ── Step 2.5: Span Smoothing (Anti-Rollercoastering) ──────────────────────────
+
+def _span_smoothing(vpi_stations: np.ndarray,
+                     terrain_interp: PchipInterpolator,
+                     max_grade_pct: float,
+                     max_span_length_m: float = 600.0,
+                     max_fill_cut_m: float = 5.0) -> np.ndarray:
+    """
+    Remove intermediate VPIs if spanning across them directly (from an earlier VPI
+    to a later one) results in a grade within limits AND the maximum resulting cut/fill
+    is acceptable. This prevents the alignment from unnecessarily hugging every minor 
+    dip or bump (rollercoastering).
+    """
+    n = len(vpi_stations)
+    if n <= 2:
+        return vpi_stations
+        
+    z_terrain = terrain_interp(vpi_stations)
+    keep = [True] * n
+    
+    i = 0
+    while i < n - 2:
+        # Try to span from VPI i to VPI j
+        for j in range(min(n - 1, i + 5), i + 1, -1):
+            if not keep[j]:
+                continue
+                
+            dx = vpi_stations[j] - vpi_stations[i]
+            if dx > max_span_length_m:
+                continue
+                
+            dz = z_terrain[j] - z_terrain[i]
+            grade = (dz / dx) * 100.0
+            
+            # If the direct grade is too steep, we can't span it
+            # We use 80% of max_grade to leave room for the final grade clipping
+            if abs(grade) > max_grade_pct * 0.8:
+                continue
+                
+            # Check maximum deviation (cut/fill) for all intermediate points
+            valid_span = True
+            for k in range(i + 1, j):
+                s_k = vpi_stations[k]
+                z_k_terrain = z_terrain[k]
+                
+                # Z on the spanned line
+                z_k_span = z_terrain[i] + (grade / 100.0) * (s_k - vpi_stations[i])
+                
+                if abs(z_k_span - z_k_terrain) > max_fill_cut_m:
+                    valid_span = False
+                    break
+                    
+            if valid_span:
+                # We can safely drop all VPIs between i and j
+                for k in range(i + 1, j):
+                    keep[k] = False
+                i = j - 1 # Next outer loop will increment to j
+                break # Move to next starting VPI
+                
+        i += 1
+        
+    smoothed_stations = vpi_stations[keep]
+    if len(smoothed_stations) < len(vpi_stations):
+        log.info(f"Span smoothing: reduced VPIs from {len(vpi_stations)} to {len(smoothed_stations)}")
+        
+    return smoothed_stations
 
 
 # ── Step 3: Grade-clipping — forward sweep ───────────────────────────────────
@@ -633,6 +699,16 @@ def build_vertical_alignment(
         distances_m, terrain_interp,
         min_spacing_m=min_vpi_spacing_m,
         peak_prominence=peak_prominence,
+    )
+    
+    # ── Step 2.5: Span Smoothing ─────────────────────────────────────────────
+    # Allow larger fill/cut spans for higher design speeds to keep momentum
+    span_max_fill_cut = 5.0 if design_speed_kmph >= 100.0 else 3.0
+    vpi_stations = _span_smoothing(
+        vpi_stations, terrain_interp,
+        max_grade_pct=max_grade_pct,
+        max_span_length_m=800.0 if design_speed_kmph >= 100.0 else 400.0,
+        max_fill_cut_m=span_max_fill_cut
     )
 
     # ── Step 3: Grade-clip VPI elevations ────────────────────────────────────

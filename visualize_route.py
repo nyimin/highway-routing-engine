@@ -520,6 +520,7 @@ def _plot_folium_map(route_wgs84, slope_along_route, meta, thresholds,
     s_opt = thresholds.get("s_opt", 4)
     s_mod = thresholds.get("s_mod", 8)
     s_max = thresholds.get("s_max", 12)
+    s_cliff = thresholds.get("s_cliff", 15)
 
     def _slope_color(s):
         if s <= s_opt:
@@ -530,22 +531,33 @@ def _plot_folium_map(route_wgs84, slope_along_route, meta, thresholds,
             return "#e67e22"
         return "#c0392b"
 
-    # Draw route as segments
+    # Draw route as ColorLine
     route_fg = folium.FeatureGroup(name="Route", show=True)
-    step = max(1, len(route_wgs84) // 3000)  # limit to ~3000 segments for performance
-    for i in range(0, len(route_wgs84) - step, step):
-        j = min(i + step, len(route_wgs84) - 1)
-        p1 = route_wgs84[i]
-        p2 = route_wgs84[j]
-        si = int(min(i, len(slope_along_route) - 1))
-        slope_val = slope_along_route[si] if si < len(slope_along_route) else 0
-        color = _slope_color(slope_val)
-
-        folium.PolyLine(
-            locations=[[p1[1], p1[0]], [p2[1], p2[0]]],
-            color=color, weight=4, opacity=0.85,
-            popup=f"Slope: {slope_val:.1f}%"
-        ).add_to(route_fg)
+    import branca.colormap as cm
+    # Create colormap matching the slope constraints
+    colormap = cm.StepColormap(
+        colors=["#2d9f3e", "#f4d03f", "#e67e22", "#c0392b"],
+        index=[0, s_opt, s_mod, s_max, s_cliff],
+        vmin=0, vmax=s_cliff
+    )
+    
+    # Decimate to max ~5000 points to keep Folium responsive
+    step = max(1, len(route_wgs84) // 5000)
+    loc_sub = [[p[1], p[0]] for p in route_wgs84[::step]]
+    
+    # Build a matching array of slope values
+    # slope_along_route is a numpy array or list
+    slope_sub = list(slope_along_route[::step]) if len(slope_along_route) > 0 else [0.0]*len(loc_sub)
+    if len(slope_sub) < len(loc_sub):
+        slope_sub.extend([0.0] * (len(loc_sub) - len(slope_sub)))
+    
+    folium.ColorLine(
+        positions=loc_sub,
+        colors=slope_sub[:len(loc_sub)],
+        colormap=colormap,
+        weight=4,
+        opacity=0.85
+    ).add_to(route_fg)
     route_fg.add_to(m)
 
     # Start/End markers
@@ -653,8 +665,24 @@ def _plot_folium_map(route_wgs84, slope_along_route, meta, thresholds,
     except Exception:
         pass
 
-    m.save(os.path.join(OUT, "route_map.html"))
-    log.info(f"Interactive map saved to {OUT}/route_map.html")
+    html_path = os.path.join(OUT, "route_map.html")
+    m.save(html_path)
+    
+    # ── CDN Patching for Restricted Networks (e.g., Myanmar) ──
+    # cdn.jsdelivr.net is frequently blocked or connection-reset in certain regions,
+    # causing Folium to render a blank white page because leaflet.js fails to load.
+    # We hot-swap the CDN URLs to unpkg / githack in the generated HTML.
+    try:
+        with open(html_path, "r", encoding="utf-8") as f:
+            html_text = f.read()
+        html_text = html_text.replace("cdn.jsdelivr.net/npm", "unpkg.com")
+        html_text = html_text.replace("cdn.jsdelivr.net/gh", "rawcdn.githack.com")
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(html_text)
+    except Exception as e:
+        log.warning(f"Could not patch CDNs in route map: {e}")
+
+    log.info(f"Interactive map saved to {html_path}")
 
 
 

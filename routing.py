@@ -256,7 +256,11 @@ def apply_rubber_band_penalty(cost, start_rc, end_rc, weight, reference_mask=Non
     bb_diag = math.sqrt(float((r1 - r0) ** 2 + (c1 - c0) ** 2))
     norm_diag = max(bb_diag, max(rows, cols) * 0.1, 1.0)  # floor to avoid near-zero
     normalized_dist = perp_dist_px / norm_diag
-    exponent = np.clip(normalized_dist * weight, 0.0, 3.0)
+    # Fix: Coastward Route Detouring Anomaly.
+    # The cap was 3.0 (exp(3) = 20x). The mountain passes have a 250x base cost.
+    # Forcing it over the mountains requires the detour penalty to exceed 250x.
+    # exp(6) = 403, exp(10) = 22,026. Raised cap to 10.0.
+    exponent = np.clip(normalized_dist * weight, 0.0, 10.0)
     return cost * np.exp(exponent)
 
 
@@ -569,8 +573,10 @@ def multi_scale_lcp(cost_pyramid, start_rc, end_rc, water_mask, transform, resol
     curr_start = _clamp_rc((start_rc[0] // coarsest_ratio, start_rc[1] // coarsest_ratio), cost_pyramid[-1].shape)
     curr_end = _clamp_rc((end_rc[0] // coarsest_ratio, end_rc[1] // coarsest_ratio), cost_pyramid[-1].shape)
     
+    from config import RUBBER_BAND_MACRO_W
     log.info(f"MS-LCP: Pass 0 (Level {levels}) - Routing on {cost_pyramid[-1].shape} grid.")
-    curr_path = find_path(cost_pyramid[-1], curr_start, curr_end)
+    coarse_cost = apply_rubber_band_penalty(cost_pyramid[-1], curr_start, curr_end, weight=RUBBER_BAND_MACRO_W)
+    curr_path = find_path(coarse_cost, curr_start, curr_end)
     
     if FAST_MODE and levels > 0:
         log.info("FAST_MODE active — returning upsampled coarse path.")

@@ -1,0 +1,8 @@
+Inspecting outputs...
+Fine Cost - Shape: (1737, 9416)
+Fine Cost - Max valid: 206075.234375
+Fine Cost - Mean valid: 1097.2015380859375
+Fine Cost - Impassable cells: 2715323
+Level 1 not found or error: output/cost_pyramid_L1.tif: No such file or directory
+Level 2 not found or error: output/cost_pyramid_L2.tif: No such file or directory
+Level 3 not found or error: output/cost_pyramid_L3.tif: No such file or directory

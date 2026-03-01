@@ -26,7 +26,7 @@ DEM_NODATA_SENTINEL = -9999.0   # Internal sentinel for NoData cells
 
 # ── Scenario Profile ──────────────────────────────────────────────────────────
 # Options: "expressway" | "rural_trunk" | "mountain_road"
-SCENARIO_PROFILE = "rural_trunk"
+SCENARIO_PROFILE = "expressway"
 
 _PROFILES = {
     # Myanmar expressway standard (Yangon–Naypyidaw style)
@@ -35,11 +35,11 @@ _PROFILES = {
         slope_optimal_pct=2.0,
         slope_moderate_pct=5.0,
         slope_max_pct=6.0,
-        slope_cliff_pct=15.0,
+        slope_cliff_pct=50.0,   # industry standard: competent soil cut slope limit ~50% (26°); was 15% which incorrectly made gentle hills impassable
         min_curve_radius=500,
         superelevation_max=0.08,
-        rubber_band_macro_weight=0.05,
-        rubber_band_micro_weight=0.01,
+        rubber_band_macro_weight=15.0,    # Was 0.05, much too weak for normalised [0..1]
+        rubber_band_micro_weight=5.0,     # Was 0.01
         # Phase 12: 3D-CHA* inspired parameters
         earthwork_proxy_weight=0.25,      # lower for flat expressway corridors
         min_tangent_length_m=300.0,       # AASHTO at 100 km/h
@@ -47,19 +47,19 @@ _PROFILES = {
     ),
     # Rural/regional trunk (most Myanmar inter-city corridors)
     "rural_trunk": dict(
-        design_speed_kmph=60,
+        design_speed_kmph=80,
         slope_optimal_pct=4.0,
         slope_moderate_pct=8.0,
-        slope_max_pct=12.0,
-        slope_cliff_pct=20.0,
-        min_curve_radius=150,
+        slope_max_pct=10.0,
+        slope_cliff_pct=55.0,   # was 18%; raised to 55% (29°) — switchbacks viable up to this terrain slope
+        min_curve_radius=250,
         superelevation_max=0.08,
-        rubber_band_macro_weight=0.03,
-        rubber_band_micro_weight=0.005,
+        rubber_band_macro_weight=12.0,
+        rubber_band_micro_weight=4.0,
         # Phase 12: 3D-CHA* inspired parameters
         earthwork_proxy_weight=0.30,      # moderate — balance earthwork vs route length
         min_tangent_length_m=200.0,       # Myanmar DRD rural trunk standard
-        min_curve_length_m=100.0,         # 3× superelevation run-off at 60 km/h
+        min_curve_length_m=120.0,         # ~3 seconds at 80 km/h
     ),
     # Mountain road (Chin Hills, eastern Shan, Kachin — switchbacks acceptable)
     "mountain_road": dict(
@@ -67,7 +67,7 @@ _PROFILES = {
         slope_optimal_pct=6.0,
         slope_moderate_pct=10.0,
         slope_max_pct=14.0,
-        slope_cliff_pct=22.0,
+        slope_cliff_pct=60.0,   # was 22%; mountain roads use switchbacks up to 60% terrain slope
         min_curve_radius=60,
         superelevation_max=0.10,
         rubber_band_macro_weight=0.02,
@@ -228,7 +228,16 @@ LULC_EDGE_DECAY_M = 150  # Distance over which penalty decays to 1.0 outside pol
 # Tier 2: medium river 50–200 m → medium bridge
 # Tier 3: large river 200–500 m → major bridge (Chindwin-scale)
 # Tier 4: navigation river >500 m → Ayeyarwady-scale; find narrowest crossing
-WATER_PENALTY_TIERS = [5.0, 50.0, 500.0, 5000.0, 50000.0]
+# Note: Expressways cost ~$16M/km. Major bridges cost ~$80M-$100M/km. The ratio is ~5x to 8x.
+# A multiplier of 50000x would make the router detour 100,000km to avoid a 2km river.
+# Calibrated to the ACTUAL cost surface value scale (land terrain p75≈750, p95≈6500).
+# Penalties use np.maximum (not additive) so these are FLOOR costs for water cells.
+# Tier 0: culvert (<10 m)             → floor at 2,000  (cheap but not trivial)
+# Tier 1: small bridge (10–50 m)      → floor at 8,000  (above land p95)
+# Tier 2: medium bridge (50–200 m)    → floor at 50,000 (Chindwin approach)
+# Tier 3: major bridge (200–500 m)    → floor at 200,000
+# Tier 4: Ayeyarwady-scale (>500 m)   → floor at 500,000 (near-impassable)
+WATER_PENALTY_TIERS = [2_000, 8_000, 50_000, 200_000, 500_000]
 
 # Bridge constraints
 MIN_BRIDGE_SPACING_M = 10_000   # Minimum distance between two major bridge sites
@@ -238,7 +247,7 @@ BRIDGE_BANK_SETBACK_M = 15.0    # Setback from riverbank edge to the abutment
 FLOODPLAIN_MIN_FILL_M = 2.5     # Assumed min height of embankment across a floodplain
 
 # ── Legacy flat penalty (retained as fallback if hierarchy fails) ───────────────
-WATER_PENALTY = 5_000
+WATER_PENALTY = 5.0
 
 # ── Grid / Routing ────────────────────────────────────────────────────────────
 IMPASSABLE   = 1e9
@@ -353,18 +362,18 @@ OUTPUT_FILE_3D: str = "preliminary_route_3d.geojson"
 # CARRIAGEWAY_WIDTH_M: trafficable surface only — used for pavement billing.
 # Myanmar DRD typical sections:
 #   rural_trunk  (2-lane): 7.0 m carriageway + 2×2.0 m shoulders = 11.0 m total
-#   expressway   (4-lane): 14.6 m carriageway + 2×3.0 m shoulders = 20.6 m → use 24 m
+#   expressway   (8-lane): 28.0 m carriageway + 2×2.5 m outer shoulders + 3.0 m median = 36.0 m
 #   mountain_road (1.5-lane): 6.0 m carriageway + 2×1.0 m shoulders = 8.0 m
 FORMATION_WIDTH_M: dict[str, float] = {
-    "expressway":    24.0,
+    "expressway":    36.0,
     "rural_trunk":   11.0,
     "mountain_road":  8.0,
 }
 
 # Carriageway-only width for pavement cost billing (no shoulders).
-# Source: Myanmar DRD Standard Cross-Sections 2019.
+# Source: JICA Myanmar Expressway Spec 2015.
 CARRIAGEWAY_WIDTH_M: dict[str, float] = {
-    "expressway":    14.6,   # 4 lanes × 3.65 m
+    "expressway":    28.0,   # 8 lanes × 3.5 m
     "rural_trunk":    7.0,   # 2 lanes × 3.5 m
     "mountain_road":  6.0,   # 2 narrow lanes × 3.0 m
 }
@@ -406,16 +415,43 @@ BRIDGE_FREEBOARD_M: float = 1.5
 BRIDGE_COST_PER_M2_USD: float = 3_500.0
 
 # BRIDGE_DECK_WIDTH_M: assumed total deck width = carriageway + guardwalls.
-# rural_trunk (2-lane): 11.0 m carriageway + 0.5 m per side = 12.0 m
-BRIDGE_DECK_WIDTH_M: float = 12.0
+# expressway (8-lane): 36.0 m structural formation
+BRIDGE_DECK_WIDTH_M: float = 36.0
 
 # CULVERT ALLOWANCE (Parametric per-km cost instead of individual pinpointing)
 # At the preliminary stage, counting individual culverts via D8 accumulation
 # is spurious. We apply a flat allowance per km based on terrain.
 # Myanmar DRD standard allowance: USD 25,000–40,000 per km depending on terrain.
 DRAINAGE_ALLOWANCE_PER_KM_USD: dict[str, float] = {
-    "expressway":    40_000.0,
+    "expressway":    150_000.0,   # Expressway needs larger/longer box culverts (36m wide formation)
     "rural_trunk":   30_000.0,
+    "mountain_road": 50_000.0,
+}
+
+# ── Phase 8a: Additional Structural & Expressway Allowances ───────────
+
+# Soft soil treatment / ground improvement (PVDs, stone columns, replacement)
+# Highly critical in lower Myanmar (Bago, Yangon).
+GROUND_IMPROVEMENT_ALLOWANCE_PER_KM_USD: dict[str, float] = {
+    "expressway":    2_000_000.0, # Significant piling/PVD over 36m formation
+    "rural_trunk":   250_000.0,
+    "mountain_road": 50_000.0,
+}
+
+# Interchanges / Grade Separation (Parametric frequency)
+# Expressways require massive overpasses/underpasses for local road crossings
+# and full cloverleaf/trumpet interchanges for access.
+INTERCHANGE_SPACING_KM: dict[str, float] = {
+    "expressway":    25.0,        # Average 1 interchange every 25 km
+    "rural_trunk":   9999.0,      # Not applicable (at-grade intersections)
+    "mountain_road": 9999.0,
+}
+INTERCHANGE_COST_USD: float = 15_000_000.0  # Parametric cost per interchange
+
+# Road Furniture (Toll plazas, weigh stations, lighting, safety barriers, signs)
+ROAD_FURNITURE_ALLOWANCE_PER_KM_USD: dict[str, float] = {
+    "expressway":    800_000.0,   # High-mast lighting, concrete median barriers, tolling IT
+    "rural_trunk":   80_000.0,
     "mountain_road": 50_000.0,
 }
 
@@ -471,10 +507,10 @@ WORLDCOVER_PENALTIES: dict[int, float] = {
     20:  1.5,   # Shrubland → scrub removal
     30:  1.2,   # Grassland → minimal impact
     40:  1.8,   # Cropland → agricultural compensation
-    50:  3.0,   # Built-up → urban penalty (supplements building layer)
+    50:  5.0,   # Built-up → urban ROW acquisition + demolition (was 3.0; raised to reflect 4–6× greenfield cost in Myanmar)
     60:  1.3,   # Bare / sparse vegetation → hard surface
     70:  1.0,   # Snow and ice → N/A for Myanmar
-    80:  5.0,   # Permanent water bodies → water crossing penalty
+    80:  500.0, # Permanent water bodies (confirmed open water/ocean) — near-impassable; was 5.0 which allowed routing through lakes
     90:  5.0,   # Herbaceous wetland → drainage + subgrade stabilisation
     95:  6.0,   # Mangroves → extreme piling + ESG scrutiny
     100: 1.5,   # Moss and lichen → similar to shrubland
@@ -511,22 +547,26 @@ OPENTOPO_URL = "https://portal.opentopography.org/API/globaldem"
 
 # ── Phase 9: Parametric Cost Model ────────────────────────────────────────────
 #
-# Unit rates from Myanmar DRD schedule-of-rates and World Bank ROCKS 2020–2024.
+# Unit rates from Myanmar DRD schedule-of-rates and JICA 2020 Bago-Kyaikto validation.
 # All values are in USD; preliminary estimates with ±25% accuracy for ADB/WB
 # pre-feasibility studies.
 
 # Earthwork unit rates
-EARTHWORK_CUT_RATE_USD_M3: float  = 8.0
-EARTHWORK_FILL_RATE_USD_M3: float = 15.0
+EARTHWORK_CUT_RATE_USD_M3: float  = 12.0
+EARTHWORK_FILL_RATE_USD_M3: float = 20.0
 
 # Pavement unit rate (flexible pavement, 50 mm AC on 200 mm granular base)
-# Myanmar DRD rural_trunk spec. USD 100–140/m²; default 120.
-PAVEMENT_RATE_USD_M2: float = 120.0
+# Expressway: Heavy-duty thick AC on structural subbase.
+PAVEMENT_RATE_USD_M2: dict[str, float] = {
+    "expressway":    250.0,
+    "rural_trunk":   120.0,
+    "mountain_road": 100.0,
+}
 
 # Land acquisition corridor width (m).
-# rural_trunk: 30 m formation + 2×15 m buffer = 60 m total strip.
+# expressway: NH-1 JICA Standard 122m (400ft) ROW.
 # ha acquired = length_km × 1000 × CORRIDOR_WIDTH_M / 10_000
-CORRIDOR_WIDTH_M: float = 60.0
+CORRIDOR_WIDTH_M: float = 122.0
 
 # Fallback land acquisition rate when LULC data is unavailable (USD/ha).
 LAND_ACQ_DEFAULT_USD_PER_HA: float = 7_500.0

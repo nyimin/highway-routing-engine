@@ -5,7 +5,7 @@ It fetches elevation (DEM) and infrastructure data (OpenStreetMap), builds a
 multi-layer cost surface, runs two-resolution pathfinding, and exports
 engineering-grade GeoJSON outputs with a 10-product visualization suite.
 
-> **Current phase: 14.3** — Segment-Aware Terrain Adaptive Smoothing, Custom Water `.gpkg` Integration, and Dam & Reservoir Absolute Avoidance complete.
+> **Current phase: 14.4** — Routing Logic Corrections (Coastward Detour / Additive Water Penalty Fixes), Custom Water `.gpkg` Integration, and Dam & Reservoir Absolute Avoidance complete.
 
 ---
 
@@ -103,6 +103,7 @@ Automatically generates 12 diagnostic products after routing:
 ├── cost_model.py            # Parametric cost aggregation
 ├── report.py                # Jinja2/WeasyPrint feasibility report generator
 ├── visualize_route.py       # 12-product visualization suite
+├── serve.py                 # No-cache local HTTP server for auto-viewing outputs
 ├── templates/               # Jinja2 templates (report.html)
 ├── requirements_alignment.txt
 ├── .env                     # OPENTOPOGRAPHY_API_KEY (not committed)

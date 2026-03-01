@@ -13,28 +13,29 @@ earthwork volumetrics, a bridge/culvert structure inventory, a parametric cost m
 
 ## Phase History
 
-| Phase    | Scope                                                                                            |
-| -------- | ------------------------------------------------------------------------------------------------ |
-| 1–2      | DEM fetch (OpenTopography fallback chain), basic slope cost, OSM buildings/water                 |
-| 3        | D8 flow-accumulation stream fallback when OSM water is sparse                                    |
-| 4        | Two-resolution coarse-to-fine routing, corridor band masking, FMM/Dijkstra engine                |
-| 5.0      | Numba JIT (`try_jit`), vectorised flow-accumulation, `tracemalloc`, auto `COARSE_FACTOR`         |
-| 5.1      | LULC environmental multipliers, road discount, 5-tier river hierarchy with bridge siting         |
-| 5.2      | Area-based building penalties with EDT distance-decay, chunked rasterization                     |
-| 5.3      | Routing polish, 12-product visualization suite, stability audit                                  |
-| 5.4      | Class-based road discounts, expanded LULC table (18 categories), OSM data mitigations            |
-| **6**    | **Vertical alignment — grade-clipping FGL, parabolic VCs, 3D GeoJSON export**                    |
-| **7**    | **Earthwork volumes — trapezoidal AEA, Brückner mass-haul, CSV export**                          |
-| **8**    | **Bridge & culvert inventory — geometric crossing detection, D8 culvert siting**                 |
-| **9**    | **Parametric Cost Model — aggregate all cost components into USD breakdown**                     |
-| **10**   | **Automated Feasibility Report — Jinja2 HTML → PDF (with WeasyPrint)**                           |
-| **11**   | **Earthwork Proxy — route pathfinding accounts for local terrain relief volumes**                |
-| **12**   | **Design Validations — enforces minimum geometric lengths for curves and tangents**              |
-| **13**   | **Multi-Bridge Support — continuous pathfinding sequences through N identified bridges**         |
-| **14**   | **MS-LCP Optimization — Tang & Dou (2023) progressive pyramid & parallel segmented routing**     |
-| **14.1** | **Geometric Refinement — Segment-aware weighted B-splines for terrain-adaptive smoothing**       |
-| **14.2** | **Custom Water Integration — High-fidelity GeoPackage polygon rivers replacing OSM LineStrings** |
-| **14.3** | **Dam & Reservoir Avoidance — Absolute routing exclusion buffers around critical waterbodies**   |
+| Phase    | Scope                                                                                                             |
+| -------- | ----------------------------------------------------------------------------------------------------------------- |
+| 1–2      | DEM fetch (OpenTopography fallback chain), basic slope cost, OSM buildings/water                                  |
+| 3        | D8 flow-accumulation stream fallback when OSM water is sparse                                                     |
+| 4        | Two-resolution coarse-to-fine routing, corridor band masking, FMM/Dijkstra engine                                 |
+| 5.0      | Numba JIT (`try_jit`), vectorised flow-accumulation, `tracemalloc`, auto `COARSE_FACTOR`                          |
+| 5.1      | LULC environmental multipliers, road discount, 5-tier river hierarchy with bridge siting                          |
+| 5.2      | Area-based building penalties with EDT distance-decay, chunked rasterization                                      |
+| 5.3      | Routing polish, 12-product visualization suite, stability audit                                                   |
+| 5.4      | Class-based road discounts, expanded LULC table (18 categories), OSM data mitigations                             |
+| **6**    | **Vertical alignment — grade-clipping FGL, parabolic VCs, 3D GeoJSON export**                                     |
+| **7**    | **Earthwork volumes — trapezoidal AEA, Brückner mass-haul, CSV export**                                           |
+| **8**    | **Bridge & culvert inventory — geometric crossing detection, D8 culvert siting**                                  |
+| **9**    | **Parametric Cost Model — aggregate all cost components into USD breakdown (Supports 8-Lane Expressway scale)**   |
+| **10**   | **Automated Feasibility Report — Jinja2 HTML → PDF (with WeasyPrint)**                                            |
+| **11**   | **Earthwork Proxy — route pathfinding accounts for local terrain relief volumes**                                 |
+| **12**   | **Design Validations — enforces minimum geometric lengths for curves and tangents**                               |
+| **13**   | **Multi-Bridge Support — continuous pathfinding sequences through N identified bridges**                          |
+| **14**   | **MS-LCP Optimization — Tang & Dou (2023) progressive pyramid & parallel segmented routing**                      |
+| **14.1** | **Geometric Refinement — Segment-aware weighted B-splines for terrain-adaptive smoothing**                        |
+| **14.2** | **Custom Water Integration — High-fidelity GeoPackage polygon rivers replacing OSM LineStrings**                  |
+| **14.3** | **Dam & Reservoir Avoidance — Absolute routing exclusion buffers around critical waterbodies**                    |
+| **14.4** | **Routing Logic Corrections — Fixed multiplicative/additive water penalties, resolving coastal detour anomalies** |
 
 ---
 
@@ -228,6 +229,7 @@ OUTPUT_COST_CSV             = "output/cost_estimate.csv"
 
 - Aggregates earthwork, structure, land acquisition (LULC weighted), pavement, and percentage-based contingency/environmental metrics.
 - Computes `cost_per_km_usd` and `total_project_cost_usd`.
+- **Expressway Support**: Accurately scales geometric widths (36.0m formation) and includes heavy infrastructure allowances (Ground Improvement piling, Grade-Separated Interchanges, Road Furniture) yielding ~$15M-$20M/km realistic estimates for 8-lane expressways.
 
 ---
 

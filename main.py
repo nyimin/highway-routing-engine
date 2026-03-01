@@ -773,7 +773,7 @@ def main():
             lulc_wgs=lulc_wgs,
             cut_rate_usd_m3=EARTHWORK_CUT_RATE_USD_M3,
             fill_rate_usd_m3=EARTHWORK_FILL_RATE_USD_M3,
-            pavement_rate_m2=PAVEMENT_RATE_USD_M2,
+            pavement_rate_m2=PAVEMENT_RATE_USD_M2.get(SCENARIO_PROFILE, 120.0) if isinstance(PAVEMENT_RATE_USD_M2, dict) else PAVEMENT_RATE_USD_M2,
             corridor_width_m=CORRIDOR_WIDTH_M,
             land_acq_default=LAND_ACQ_DEFAULT_USD_PER_HA,
             land_acq_rates=LAND_ACQ_RATES,
@@ -952,6 +952,34 @@ def main():
                 'si_result': si_result,
             }
             generate_all_visuals(viz_data)
+
+            # ── Auto-launch route_map.html in browser ─────────────────────
+            # serve.py handles port-already-in-use gracefully (just opens browser).
+            # On a fresh run it starts a no-cache server so the browser always
+            # gets the latest generated file.
+            try:
+                import subprocess, webbrowser, time as _time, socket as _sock
+                PORT = 8765
+
+                def _port_in_use(p):
+                    with _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM) as s:
+                        s.settimeout(0.3)
+                        return s.connect_ex(("127.0.0.1", p)) == 0
+
+                if not _port_in_use(PORT):
+                    # Start a new detached serve.py process
+                    kwargs = {"creationflags": 0x00000008} if sys.platform == "win32" else {"start_new_session": True}
+                    subprocess.Popen(
+                        [sys.executable, "serve.py", "--bg"],
+                        **kwargs
+                    )
+                    _time.sleep(0.8)  # allow server to bind
+
+                webbrowser.open(f"http://127.0.0.1:{PORT}/route_map.html")
+                log.info(f"Route map opened in browser: http://127.0.0.1:{PORT}/route_map.html")
+            except Exception as _e:
+                log.warning(f"Could not auto-open route map: {_e}")
+
         except Exception as exc:
             log.warning(f"Visualization suite failed: {exc}")
             import traceback as _tb

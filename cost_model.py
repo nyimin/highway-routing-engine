@@ -50,15 +50,20 @@ class CostModelResult:
     """
     # ── Civil components ──────────────────────────────────────────────────
     earthwork_cut_usd:      float   # USD for cut excavation
-    earthwork_fill_usd:     float   # USD for imported borrow fill (0 if net surplus)
+    earthwork_fill_usd:     float   # USD for all borrow and reused fill placement
     pavement_usd:           float   # USD for flexible pavement surface
     bridges_usd:            float   # USD from Phase 8 structure inventory
     drainage_usd:           float   # Parametric allowance based on route length
     land_acquisition_usd:   float   # USD for RoW land compensation
 
+    # ── Expressway / Structural Additions ─────────────────────────────────
+    ground_improvement_usd: float   # USD for soft soil treatment
+    interchanges_usd:       float   # USD for grade-separated interchanges
+    road_furniture_usd:     float   # USD for toll plazas, lighting, barriers
+
     # ── Soft costs ────────────────────────────────────────────────────────
     environmental_usd:      float   # ENV_MITIGATION_FACTOR × civil_subtotal
-    civil_subtotal_usd:     float   # sum of all 6 civil components
+    civil_subtotal_usd:     float   # sum of all civil components
     contingency_usd:        float   # CONTINGENCY_FACTOR × civil_subtotal
     engineering_usd:        float   # ENGINEERING_FACTOR × civil_subtotal
 
@@ -215,21 +220,19 @@ def compute_cost_model(
     if ew_result is not None:
         ew_cut_usd  = ew_result.total_cut_m3  * cut_rate_usd_m3
         net_import  = ew_result.net_import_m3
-        ew_fill_usd = max(0.0, net_import) * fill_rate_usd_m3
+        
+        # For preliminary design, bill the cost of excavating ALL cut AND placing/compacting ALL fill.
+        ew_fill_usd = ew_result.total_fill_m3 * fill_rate_usd_m3
+        
         log.info(
             f"  Earthwork cut:  {ew_result.total_cut_m3/1e6:.2f} Mm³ "
             f"× USD {cut_rate_usd_m3}/m³ = USD {ew_cut_usd/1e6:.2f} M"
         )
-        if net_import > 0:
-            log.info(
-                f"  Import fill:    {net_import/1e6:.2f} Mm³ "
-                f"× USD {fill_rate_usd_m3}/m³ = USD {ew_fill_usd/1e6:.2f} M"
-            )
-        else:
-            log.info(
-                f"  Net surplus spoil — no import fill cost "
-                f"({abs(net_import)/1e3:.1f} km³ excess)"
-            )
+        log.info(
+            f"  Earthwork fill: {ew_result.total_fill_m3/1e6:.2f} Mm³ "
+            f"× USD {fill_rate_usd_m3}/m³ = USD {ew_fill_usd/1e6:.2f} M"
+        )
+        log.info(f"  (Net balance:   {'import' if net_import > 0 else 'surplus spoil'} {abs(net_import)/1e6:.2f} Mm³)")
     else:
         log.warning("CostModel: ew_result is None — earthwork costs set to 0.")
         ew_cut_usd  = 0.0
@@ -287,9 +290,41 @@ def compute_cost_model(
     )
 
     # ── Civil subtotal (items 1-6) ────────────────────────────────────────
+    
+    # ── 6b. Expressway / Structural Additions ─────────────────────────────
+    try:
+        from config import (
+            GROUND_IMPROVEMENT_ALLOWANCE_PER_KM_USD,
+            INTERCHANGE_SPACING_KM,
+            INTERCHANGE_COST_USD,
+            ROAD_FURNITURE_ALLOWANCE_PER_KM_USD
+        )
+        ground_impr_rate = GROUND_IMPROVEMENT_ALLOWANCE_PER_KM_USD.get(scenario_profile, 0.0)
+        interchange_spacing = INTERCHANGE_SPACING_KM.get(scenario_profile, 9999.0)
+        interchange_cost = INTERCHANGE_COST_USD
+        road_furniture_rate = ROAD_FURNITURE_ALLOWANCE_PER_KM_USD.get(scenario_profile, 0.0)
+    except ImportError:
+        ground_impr_rate = 0.0
+        interchange_spacing = 9999.0
+        interchange_cost = 0.0
+        road_furniture_rate = 0.0
+
+    ground_improvement_usd = ground_impr_rate * total_length_km
+    num_interchanges = int(total_length_km / interchange_spacing) if interchange_spacing > 0 else 0
+    interchanges_usd = float(num_interchanges * interchange_cost)
+    road_furniture_usd = road_furniture_rate * total_length_km
+
+    if ground_improvement_usd > 0:
+        log.info(f"  Ground imprv.:  USD {ground_improvement_usd/1e6:.2f} M")
+    if interchanges_usd > 0:
+        log.info(f"  Interchanges:   USD {interchanges_usd/1e6:.2f} M  ({num_interchanges} locations)")
+    if road_furniture_usd > 0:
+        log.info(f"  Road Furniture: USD {road_furniture_usd/1e6:.2f} M")
+
     civil_subtotal = (
-        ew_cut_usd + ew_fill_usd + pavement_usd +
-        bridges_usd + drainage_usd + land_usd
+        ew_cut_usd + ew_fill_usd + pavement_usd + bridges_usd + 
+        drainage_usd + land_usd + ground_improvement_usd + 
+        interchanges_usd + road_furniture_usd
     )
 
     # ── 7. Environmental mitigation ───────────────────────────────────────
@@ -334,6 +369,9 @@ def compute_cost_model(
         bridges_usd            = round(bridges_usd,   2),
         drainage_usd           = round(drainage_usd,  2),
         land_acquisition_usd   = round(land_usd,      2),
+        ground_improvement_usd = round(ground_improvement_usd, 2),
+        interchanges_usd       = round(interchanges_usd, 2),
+        road_furniture_usd     = round(road_furniture_usd, 2),
         environmental_usd      = round(env_usd,       2),
         civil_subtotal_usd     = round(civil_subtotal, 2),
         contingency_usd        = round(contingency_usd, 2),
@@ -365,10 +403,13 @@ def export_cost_csv(result: CostModelResult, output_path: str) -> None:
 
     rows = [
         ("Earthwork — Cut Excavation",    result.earthwork_cut_usd),
-        ("Earthwork — Import Fill",       result.earthwork_fill_usd),
+        ("Earthwork — Fill Placement",    result.earthwork_fill_usd),
         ("Pavement (Flexible)",           result.pavement_usd),
         ("Bridges",                       result.bridges_usd),
         ("Drainage Allowance",            result.drainage_usd),
+        ("Ground Improvement / Piling",   result.ground_improvement_usd),
+        ("Grade-Separated Interchanges",  result.interchanges_usd),
+        ("Road Furniture & Tolling IT",   result.road_furniture_usd),
         ("Land Acquisition",              result.land_acquisition_usd),
         ("Environmental Mitigation",      result.environmental_usd),
         ("Contingency (20%)",             result.contingency_usd),

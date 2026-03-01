@@ -191,7 +191,8 @@ def _slope_cost_array(slope_pct):
     t4 = (slope_pct[m4] - s_max) / max(s_cliff - s_max, 0.01)
     cost[m4] = np.minimum(
         200.0 * np.exp(t4 * math.log(20.0)),
-        IMPASSABLE * 0.1,   # hard cap: never exceed 10 % of IMPASSABLE
+        5_000.0,   # hard cap: very expensive earthwork, NOT routing-equivalent to IMPASSABLE
+                   # (was IMPASSABLE*0.1 = 100M which effectively blocked Zone 4 terrain)
     )
 
     # Zone 5 — cliff
@@ -846,8 +847,13 @@ def build_cost_surface(slope_pct, building_penalty_map, water_mask, roads_mask=N
         hierarchy_penalty = _river_hierarchy_penalties(
             water_closed.astype(np.float32), resolution_m
         )
-        # Add penalty on top of existing cost (not replace) so slope cost still matters
-        cost = np.where(water_closed, cost + hierarchy_penalty, cost)
+        # Use np.maximum (not addition) so water cells can NEVER be cheaper than
+        # the tier penalty regardless of underlying terrain cost.
+        # Previously: cost + penalty (water median was only ~12 vs land p75=752 —
+        # additive penalty was swamped by low base costs on flat water areas).
+        # Fix: water cell cost = max(existing_cost, tier_penalty) so a Tier-3
+        # river (200m span) always costs at least WATER_PENALTY_TIERS[3].
+        cost = np.where(water_closed, np.maximum(cost, hierarchy_penalty), cost)
 
         # ── 4. Bridge abutment zone recovery ─────────────────────────────
         # Relax steep-bank cells immediately adjacent to water to encourage
@@ -866,8 +872,10 @@ def build_cost_surface(slope_pct, building_penalty_map, water_mask, roads_mask=N
 
     # ── 5. Floodplain amplification ───────────────────────────────────────
     if floodplain is not None:
-        # 3× amplification — passable but costly (drainage structures, embankment)
-        cost = np.where(floodplain & (cost < IMPASSABLE), cost * 3.0, cost)
+        # 1.5× amplification — passable but costly (drainage structures, embankment fill).
+        # ADB/World Bank: floodplain embankment adds 30–80% over standard road cost.
+        # Was 3.0× which over-penalised floodplains and compounded with earthwork proxy.
+        cost = np.where(floodplain & (cost < IMPASSABLE), cost * 1.5, cost)
 
     # ── 6. Building exclusion/expropriation ───────────────────────────────
     # Phase 5.2: Buildings use an area-based concentric penalty map instead of a flat penalty
@@ -884,6 +892,25 @@ def build_cost_surface(slope_pct, building_penalty_map, water_mask, roads_mask=N
     # ── 7. NoData exclusion ───────────────────────────────────────────────
     if nodata_mask is not None:
         cost[nodata_mask] = IMPASSABLE
+
+    # ── 7b. Sea Level / Coastal Penalty ───────────────────────────────────
+    if dem is not None:
+        # Graduated coastal cost — replaces the previous binary IMPASSABLE at <=2m.
+        # Rationale:
+        #   - SRTMGL1 DEM has ±6m vertical error in delta areas; blanket IMPASSABLE
+        #     at ≤2m incorrectly blocked large inland areas due to DEM noise.
+        #   - Roads exist throughout Ayeyarwady delta at 0–2m AMSL with embankment.
+        #   - True ocean (confirmed by WorldCover class 80) is already 500× cost.
+        #   - dem <= 0m: almost certainly open water → IMPASSABLE
+        #   - 0m < dem <= 2m: coastal/tidal low-lying → 8× embankment premium
+        sea_open_water  = dem <= 0.0
+        sea_coastal_low = (dem > 0.0) & (dem <= 2.0)
+        cost = np.where(sea_open_water, IMPASSABLE, cost)
+        cost = np.where(sea_coastal_low & (cost < IMPASSABLE), cost * 8.0, cost)
+        log.info(
+            f"Sea Level: {np.sum(sea_open_water):,} sub-zero cells -> IMPASSABLE, "
+            f"{np.sum(sea_coastal_low):,} coastal 0-2m cells -> 8x cost premium."
+        )
 
     # ── 8. Border exclusion ───────────────────────────────────────────────
     b = max(1, BORDER_CELLS)
@@ -941,9 +968,19 @@ def build_cost_pyramid(fine_cost, levels=3, ratio=2, method="average"):
             )
 
         # Fix 4: Two-pass aggregation for correct IMPASSABLE propagation.
-        # Pass A: average (or max) of all fine cells — reflects terrain cost.
-        downsampled = block_reduce(current_cost, block_size=(ratio, ratio),
-                                   func=func, cval=IMPASSABLE)
+        # Pass A: average (or max) of all fine cells (excluding IMPASSABLE) — reflects terrain passability.
+        import warnings
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            # Exclude IMPASSABLE cells so they don't astronomically inflate the block average
+            safe_cost = np.where(current_cost >= IMPASSABLE * 0.5, np.nan, current_cost)
+            func_nan = np.nanmean if method == "average" else np.nanmax
+            
+            downsampled = block_reduce(safe_cost, block_size=(ratio, ratio),
+                                       func=func_nan, cval=np.nan)
+        
+        # Restore NaN to IMPASSABLE (if the block was completely IMPASSABLE or NoData padded)
+        downsampled[np.isnan(downsampled)] = IMPASSABLE
 
         # Pass B: block maximum — instead of strict block maximum (which fails
         # narrow corridors if a single 30m cell is impassable), we count the proportion
@@ -970,5 +1007,6 @@ def build_cost_pyramid(fine_cost, levels=3, ratio=2, method="average"):
             f"max_valid_cost={max_cost:.1f}"
         )
 
+    np.savez("output/cost_pyramid_debug.npz", *pyramid)
     return pyramid
 

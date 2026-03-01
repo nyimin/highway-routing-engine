@@ -577,14 +577,31 @@ def smooth_path(coords_utm, n_points=500, smoothing=None):
         # Heuristic: allow ~2 m average deviation per point
         smoothing = len(coords_utm) * 4.0
 
+    # Apply Douglas-Peucker simplification before B-spline to remove raster zig-zags
+    from shapely.geometry import LineString
+    raw_ls = LineString(coords_utm)
+    # Simplify with a tolerance of 15m. Points that deviate less than 15m from the line 
+    # connecting their neighbors are dropped, creating longer straight tangents.
+    simplified_ls = raw_ls.simplify(tolerance=15.0, preserve_topology=True)
+    simp_path = list(simplified_ls.coords)
+    
+    if len(simp_path) < 4:
+         log.warning(f"Douglas-Peucker simplification over-simplified the path ({len(simp_path)} points). Reverting to raw.")
+         simp_path = coords_utm
+    else:
+         log.info(f"Path simplification: {len(coords_utm)} -> {len(simp_path)} points")
+
+    xs = np.array([c[0] for c in simp_path])
+    ys = np.array([c[1] for c in simp_path])
+
     try:
         tck, u = splprep([xs, ys], s=smoothing, k=3)
         u_fine = np.linspace(0, 1, n_points)
         x_sm, y_sm = splev(u_fine, tck)
         return list(zip(x_sm.tolist(), y_sm.tolist()))
     except Exception as exc:
-        log.warning(f"B-spline smoothing failed ({exc}). Returning raw path.")
-        return coords_utm
+        log.warning(f"B-spline smoothing failed ({exc}). Returning simplified path.")
+        return simp_path
 
 
 def verify_curve_radius(coords_utm, min_radius=MIN_CURVE_RADIUS):
